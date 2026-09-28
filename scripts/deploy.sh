@@ -91,9 +91,9 @@ print(json.dumps(lines))
 }
 
 poll_background_build() {
-  log "Polling EC2 build (allow ~25 min)..."
+  log "Polling EC2 build (allow ~45 min)..."
   local elapsed=0
-  while [[ $elapsed -lt 1800 ]]; do
+  while [[ $elapsed -lt 2700 ]]; do
     sleep 30; elapsed=$((elapsed + 30))
 
     local poll_id

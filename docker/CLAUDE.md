@@ -49,7 +49,7 @@ v<ERPNEXT_VERSION>-axerp   e.g.  v16.36.1-axerp
 | erpnext (AXERP) | version-16 | 16.36.1-axerp | rebranded fork |
 | hrms | version-16 | 16.12.1 | |
 | crm | main | 1.77.3 | yarn pre-install required |
-| insights | `6bb39c91e0` | pinned | develop after 2026-09-14 needs frappe `ui/telemetry`, which v16.36.1 does not ship |
+| insights | develop | current | Dockerfile copies frappe develop `ui` telemetry, TrialBanner, and island onto the v16.36.1 image |
 | wiki | version-3 | 3.0.0 | |
 | blog | develop | 0.0.1 | orange icon baked in |
 
