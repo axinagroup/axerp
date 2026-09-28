@@ -17,7 +17,7 @@ class AXERPAddress(Address):
 
 	def link_address(self):
 		"""Link address based on owner"""
-		if self.is_your_company_address:
+		if self.get("is_your_company_address"):
 			return
 
 		return super().link_address()
@@ -28,7 +28,9 @@ class AXERPAddress(Address):
 				self.is_your_company_address = 1
 
 	def validate_reference(self):
-		if self.is_your_company_address and not [row for row in self.links if row.link_doctype == "Company"]:
+		if self.get("is_your_company_address") and not [
+			row for row in self.links if row.link_doctype == "Company"
+		]:
 			frappe.throw(
 				_(
 					"Address needs to be linked to a Company. Please add a row for Company in the Links table."
@@ -53,6 +55,9 @@ class AXERPAddress(Address):
 
 @frappe.whitelist()
 def get_shipping_address(company, address=None):
+	# `select`, not `read`: Delivery, Maintenance, Purchase and Stock Manager fill in forms that ask
+	# for this while holding no Company `read` row. doc= so User Permissions apply to the named company.
+	frappe.has_permission("Company", ptype="select", doc=company, throw=True)
 	filters = [
 		["Dynamic Link", "link_doctype", "=", "Company"],
 		["Dynamic Link", "link_name", "=", company],
@@ -69,4 +74,6 @@ def get_shipping_address(company, address=None):
 	if address:
 		address_as_dict = address[0]
 		name, address_template = get_address_templates(address_as_dict)
-		return address_as_dict.get("name"), frappe.render_template(address_template, address_as_dict)
+		return address_as_dict.get("name"), frappe.render_template(
+			address_template, address_as_dict, restrict_globals=True
+		)

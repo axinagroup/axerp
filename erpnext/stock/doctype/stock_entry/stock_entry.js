@@ -196,6 +196,13 @@ frappe.ui.form.on("Stock Entry", {
 			frm.set_df_property("fg_completed_qty", "read_only", 1);
 			frm.set_df_property("get_items", "hidden", 1);
 		}
+
+		if (frm.doc.pick_list) {
+			frm.set_df_property("get_items", "hidden", 1);
+			if (!frm.doc.job_card) {
+				frm.set_df_property("fg_completed_qty", "read_only", 1);
+			}
+		}
 	},
 
 	setup_quality_inspection: function (frm) {
@@ -301,6 +308,13 @@ frappe.ui.form.on("Stock Entry", {
 	refresh: function (frm) {
 		frm.trigger("get_items_from_transit_entry");
 		frm.trigger("toggle_warehouse_fields");
+
+		// only BOM-less rows are editable, and they cannot allocate a BOM percentage;
+		// read-only rows from a BOM still display their stored % of Component Cost
+		frm.fields_dict.items.grid.update_docfield_property("valuation_type", "options", [
+			"Valuation Rate",
+			"Manual",
+		]);
 		erpnext.toggle_serial_batch_fields(frm);
 
 		if (!frm.doc.docstatus && !frm.doc.subcontracting_inward_order) {
@@ -569,8 +583,6 @@ frappe.ui.form.on("Stock Entry", {
 			erpnext.accounts.dimensions.update_dimension(frm, frm.doctype);
 		}
 
-		frm.events.set_route_options_for_new_doc(frm);
-
 		frm.set_df_property(
 			"items",
 			"cannot_add_rows",
@@ -581,28 +593,6 @@ frappe.ui.form.on("Stock Entry", {
 					"Subcontracting Delivery",
 				].includes(frm.doc.purpose)
 		);
-	},
-
-	set_route_options_for_new_doc(frm) {
-		let batch_no_field = frm.get_docfield("items", "batch_no");
-		if (batch_no_field) {
-			batch_no_field.get_route_options_for_new_doc = function (row) {
-				return {
-					item: row.doc.item_code,
-				};
-			};
-		}
-
-		let sbb_field = frm.get_docfield("items", "serial_and_batch_bundle");
-		if (sbb_field) {
-			sbb_field.get_route_options_for_new_doc = (row) => {
-				return {
-					item_code: row.doc.item_code,
-					voucher_type: frm.doc.doctype,
-					warehouse: row.doc.s_warehouse || row.doc.t_warehouse,
-				};
-			};
-		}
 	},
 
 	get_items_from_transit_entry: function (frm) {
@@ -917,22 +907,15 @@ frappe.ui.form.on("Stock Entry", {
 
 	add_to_transit: function (frm) {
 		if (frm.doc.purpose == "Material Transfer") {
-			var filters = {
-				is_group: 0,
-				company: frm.doc.company,
-			};
-
 			if (frm.doc.add_to_transit) {
-				filters["warehouse_type"] = "Transit";
 				frm.set_value("to_warehouse", "");
+				(frm.doc.items || []).forEach((item) => {
+					if (item.t_warehouse) {
+						frappe.model.set_value(item.doctype, item.name, "t_warehouse", "");
+					}
+				});
 				frm.trigger("set_transit_warehouse");
 			}
-
-			frm.fields_dict.to_warehouse.get_query = function () {
-				return {
-					filters: filters,
-				};
-			};
 		}
 	},
 
@@ -1022,7 +1005,10 @@ frappe.ui.form.on("Stock Entry Detail", {
 		}
 
 		if (frm.doc.purpose === "Receive from Customer") {
-			item.t_warehouse = frm.doc.items.find((item) => item.scio_detail).t_warehouse;
+			const scio_row = frm.doc.items.find((row) => row.scio_detail);
+			if (scio_row) {
+				item.t_warehouse = scio_row.t_warehouse;
+			}
 		}
 	},
 	set_basic_rate_manually(frm, cdt, cdn) {
@@ -1032,6 +1018,29 @@ frappe.ui.form.on("Stock Entry Detail", {
 			"read_only",
 			row?.set_basic_rate_manually ? 0 : 1
 		);
+	},
+
+	secondary_item_type(frm, cdt, cdn) {
+		const row = locals[cdt][cdn];
+		if (row.bom_secondary_item) return;
+
+		if (!row.secondary_item_type) {
+			if (row.valuation_type) {
+				frappe.model.set_value(cdt, cdn, { valuation_type: "", set_basic_rate_manually: 0 });
+			}
+			return;
+		}
+
+		if (!row.valuation_type) {
+			frappe.model.set_value(cdt, cdn, "valuation_type", "Valuation Rate");
+		}
+	},
+
+	valuation_type(frm, cdt, cdn) {
+		const row = locals[cdt][cdn];
+		if (!row.secondary_item_type || row.bom_secondary_item) return;
+
+		frappe.model.set_value(cdt, cdn, "set_basic_rate_manually", row.valuation_type === "Manual" ? 1 : 0);
 	},
 
 	conversion_factor(frm, cdt, cdn) {
@@ -1212,6 +1221,28 @@ frappe.ui.form.on("Landed Cost Taxes and Charges", {
 });
 
 erpnext.stock.StockEntry = class StockEntry extends erpnext.stock.StockController {
+	setup_warehouse_query() {
+		super.setup_warehouse_query();
+
+		const transit_warehouse_query = () => {
+			const filters = {
+				is_group: 0,
+				company: this.frm.doc.company,
+			};
+
+			if (this.frm.doc.purpose === "Material Transfer" && this.frm.doc.add_to_transit) {
+				filters["warehouse_type"] = "Transit";
+			}
+
+			return {
+				filters: filters,
+			};
+		};
+
+		this.frm.set_query("to_warehouse", transit_warehouse_query);
+		this.frm.set_query("t_warehouse", "items", transit_warehouse_query);
+	}
+
 	setup() {
 		var me = this;
 
@@ -1312,6 +1343,7 @@ erpnext.stock.StockEntry = class StockEntry extends erpnext.stock.StockControlle
 	}
 
 	onload_post_render() {
+		super.onload_post_render();
 		var me = this;
 		if (me.frm.doc.__islocal && me.frm.doc.company && !me.frm.doc.amended_from) {
 			me.company();
@@ -1410,7 +1442,10 @@ erpnext.stock.StockEntry = class StockEntry extends erpnext.stock.StockControlle
 			this.frm.trigger("toggle_display_account_head");
 
 			erpnext.accounts.dimensions.update_dimension(this.frm, this.frm.doctype);
-			this.set_default_account("cost_center", "cost_center");
+
+			if (!this.frm.doc.__onload?.load_after_mapping) {
+				this.set_default_account("cost_center", "cost_center");
+			}
 
 			this.frm.refresh_fields("items");
 		}
@@ -1447,10 +1482,14 @@ erpnext.stock.StockEntry = class StockEntry extends erpnext.stock.StockControlle
 		) {
 			frappe.model.remove_from_locals("Work Order", this.frm.doc.work_order);
 		}
+
+		if (this.frm.doc.pick_list) {
+			frappe.model.remove_from_locals("Pick List", this.frm.doc.pick_list);
+		}
 	}
 
 	fg_completed_qty() {
-		if (!this.frm.doc.job_card) {
+		if (!this.frm.doc.job_card && !this.frm.doc.pick_list) {
 			this.get_items();
 		}
 	}

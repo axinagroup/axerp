@@ -9,6 +9,7 @@ from frappe import _
 from frappe.contacts.doctype.address.address import get_company_address
 from frappe.contacts.doctype.contact.contact import get_default_contact
 from frappe.desk.notifications import clear_doctype_notifications
+from frappe.model.document import Document
 from frappe.model.mapper import get_mapped_doc
 from frappe.model.utils import get_fetch_values
 from frappe.query_builder import DocType
@@ -17,6 +18,7 @@ from frappe.utils import cint, flt
 
 from erpnext.accounts.party import CROSS_PARTY_FIELD_NO_MAP, get_due_date
 from erpnext.controllers.accounts_controller import get_taxes_and_charges, merge_taxes
+from erpnext.controllers.mapper import get_qty_already_mapped
 from erpnext.controllers.selling_controller import SellingController
 
 form_grid_templates = {"items": "templates/form_grid/item_grid.html"}
@@ -414,22 +416,34 @@ class DeliveryNote(SellingController):
 				frappe.throw(_("Warehouse required for stock Item {0}").format(d["item_code"]))
 
 	def update_current_stock(self):
-		if self.get("_action") and self._action != "update_after_submit":
-			for d in self.get("items"):
-				d.actual_qty = frappe.db.get_value(
-					"Bin", {"item_code": d.item_code, "warehouse": d.warehouse}, "actual_qty"
-				)
+		if not (self.get("_action") and self._action != "update_after_submit"):
+			return
 
-			for d in self.get("packed_items"):
-				bin_qty = frappe.db.get_value(
-					"Bin",
-					{"item_code": d.item_code, "warehouse": d.warehouse},
-					["actual_qty", "projected_qty"],
-					as_dict=True,
-				)
-				if bin_qty:
-					d.actual_qty = flt(bin_qty.actual_qty)
-					d.projected_qty = flt(bin_qty.projected_qty)
+		warehouse_item_codes = {}
+		for d in self.get("items") + self.get("packed_items"):
+			warehouse_item_codes.setdefault(d.warehouse, set()).add(d.item_code)
+
+		if not warehouse_item_codes:
+			return
+
+		bin_map = {}
+		for warehouse, item_codes in warehouse_item_codes.items():
+			for b in frappe.get_all(
+				"Bin",
+				filters={"item_code": ["in", item_codes], "warehouse": warehouse},
+				fields=["item_code", "actual_qty", "projected_qty"],
+			):
+				bin_map[(b.item_code, warehouse)] = b
+
+		for d in self.get("items"):
+			bin_data = bin_map.get((d.item_code, d.warehouse))
+			d.actual_qty = bin_data.actual_qty if bin_data else None
+
+		for d in self.get("packed_items"):
+			bin_data = bin_map.get((d.item_code, d.warehouse))
+			if bin_data:
+				d.actual_qty = flt(bin_data.actual_qty)
+				d.projected_qty = flt(bin_data.projected_qty)
 
 	def on_submit(self):
 		self.validate_packed_qty()
@@ -628,6 +642,9 @@ class DeliveryNote(SellingController):
 
 	def update_billing_status(self, update_modified=True):
 		updated_delivery_notes = [self.name]
+		if self.is_return and self.return_against:
+			updated_delivery_notes.append(self.return_against)
+
 		for d in self.get("items"):
 			if d.si_detail and not d.so_detail:
 				d.db_set("billed_amt", d.amount, update_modified=update_modified)
@@ -636,7 +653,8 @@ class DeliveryNote(SellingController):
 
 		for dn in set(updated_delivery_notes):
 			dn_doc = self if (dn == self.name) else frappe.get_lazy_doc("Delivery Note", dn)
-			dn_doc.update_billing_percentage(update_modified=update_modified)
+			update_dn_modified = update_modified and dn != self.return_against
+			dn_doc.update_billing_percentage(update_modified=update_dn_modified)
 
 		self.load_from_db()
 
@@ -813,7 +831,9 @@ def get_returned_qty_map(delivery_note):
 
 
 @frappe.whitelist()
-def make_sales_invoice(source_name, target_doc=None, args=None):
+def make_sales_invoice(
+	source_name: str, target_doc: Document | str | None = None, args: dict | str | None = None
+):
 	if args is None:
 		args = {}
 	if isinstance(args, str):
@@ -824,6 +844,8 @@ def make_sales_invoice(source_name, target_doc=None, args=None):
 	to_make_invoice_qty_map = {}
 	returned_qty_map = get_returned_qty_map(source_name)
 	invoiced_qty_map = get_invoiced_qty_map(source_name)
+	for ref, qty in get_qty_already_mapped(target_doc, "dn_detail").items():
+		invoiced_qty_map[ref] = invoiced_qty_map.get(ref, 0) + qty
 
 	def set_missing_values(source, target):
 		target.run_method("set_missing_values")
@@ -897,7 +919,7 @@ def make_sales_invoice(source_name, target_doc=None, args=None):
 				"postprocess": update_item,
 				"filter": lambda d: get_pending_qty(d) <= 0
 				if not doc.get("is_return")
-				else get_pending_qty(d) > 0,
+				else get_pending_qty(d) >= 0,
 				"condition": select_item,
 			},
 			"Sales Taxes and Charges": {
@@ -919,7 +941,12 @@ def make_sales_invoice(source_name, target_doc=None, args=None):
 		frappe.get_single_value("Accounts Settings", "automatically_fetch_payment_terms")
 	)
 
-	if not doc.is_return:
+	if doc.is_return:
+		# A credit note made from a return Delivery Note should roll back the billed
+		# amount on the linked Sales Order too, so that per_billed stays consistent with
+		# per_delivered (which the return already reset).
+		doc.update_billed_amount_in_sales_order = True
+	else:
 		so, doctype, fieldname = doc.get_order_details()
 		if (
 			doc.linked_order_has_payment_terms(so, fieldname, doctype)
@@ -1145,6 +1172,7 @@ def make_sales_return(source_name, target_doc=None):
 @frappe.whitelist()
 def update_delivery_note_status(docname, status):
 	dn = frappe.get_lazy_doc("Delivery Note", docname)
+	dn.check_permission("submit")
 	dn.update_status(status)
 
 

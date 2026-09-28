@@ -12,6 +12,29 @@ from frappe import _, throw
 from frappe.model.document import Document
 from frappe.utils import cint, flt
 
+# the transactions the pricing engine is called for, from transaction.js and the POS
+PRICING_TRANSACTION_DOCTYPES = frozenset(
+	{
+		"Quotation",
+		"Sales Order",
+		"Delivery Note",
+		"Sales Invoice",
+		"POS Invoice",
+		"Supplier Quotation",
+		"Purchase Order",
+		"Purchase Receipt",
+		"Purchase Invoice",
+		"Material Request",
+		# these three also extend a controller that calls the pricing engine: BOM and BOM Creator
+		# through TransactionController, Request for Quotation through BuyingController
+		"BOM",
+		"BOM Creator",
+		"Request for Quotation",
+		# no client sends this one, but set_transaction_type below still branches on it
+		"Opportunity",
+	}
+)
+
 apply_on_dict = {"Item Code": "items", "Item Group": "item_groups", "Brand": "brands"}
 
 other_fields = ["other_item_code", "other_item_group", "other_brand"]
@@ -155,6 +178,24 @@ class PricingRule(Document):
 			values = [d.get(apply_on_field) for d in self.get(apply_on_table) if d.get(apply_on_field)]
 			if len(values) != len(set(values)):
 				frappe.throw(_("Duplicate {0} found in the table").format(self.apply_on))
+
+			if self.apply_on == "Item Code":
+				self.validate_template_with_variant(values)
+
+	def validate_template_with_variant(self, item_codes):
+		# throws if a template and its variant both exist in one rule
+		variants = frappe.get_all(
+			"Item",
+			filters={"name": ("in", item_codes), "variant_of": ("in", item_codes)},
+			fields=["name", "variant_of"],
+		)
+		if variants:
+			variant = variants[0]
+			frappe.throw(
+				_("Variant {0} and its template {1} cannot both be added to the same Pricing Rule").format(
+					frappe.bold(variant.name), frappe.bold(variant.variant_of)
+				)
+			)
 
 	def validate_mandatory(self):
 		if self.has_priority and not self.priority:
@@ -345,6 +386,18 @@ def apply_pricing_rule(args, doc=None):
 		args = json.loads(args)
 
 	args = frappe._dict(args)
+
+	# The transaction being priced decides who may price it; doc= where the caller named one.
+	# An allow-list, not a type check: any readable doctype would otherwise satisfy has_permission.
+	transaction_doctype = args.get("doctype")
+	if transaction_doctype not in PRICING_TRANSACTION_DOCTYPES:
+		frappe.throw(_("Invalid doctype"), frappe.PermissionError)
+
+	transaction_name = args.get("name")
+	if not isinstance(transaction_name, str) or not frappe.db.exists(transaction_doctype, transaction_name):
+		transaction_name = None
+
+	frappe.has_permission(transaction_doctype, doc=transaction_name, throw=True)
 
 	set_transaction_type(args)
 
@@ -704,14 +757,18 @@ def set_transaction_type(pricing_ctx: frappe._dict) -> None:
 @frappe.whitelist()
 @frappe.validate_and_sanitize_search_inputs
 def get_item_uoms(doctype, txt, searchfield, start, page_len, filters):
-	items = [filters.get("value")]
-	if filters.get("apply_on") != "Item Code":
-		field = frappe.scrub(filters.get("apply_on"))
-		items = [d.name for d in frappe.db.get_all("Item", filters={field: filters.get("value")})]
+	if filters.get("apply_on") == "Item Code":
+		item_filters = [["name", "=", filters.get("value")]]
+	else:
+		item_filters = [[frappe.scrub(filters.get("apply_on")), "=", filters.get("value")]]
+
+	items = frappe.get_list("Item", filters=item_filters, pluck="name")
+	if not items:
+		return []
 
 	return frappe.get_all(
 		"UOM Conversion Detail",
-		filters={"parent": ("in", items), "uom": ("like", f"{txt}%")},
+		filters={"parent": ("in", items), "parenttype": "Item", "uom": ("like", f"{txt}%")},
 		fields=["uom"],
 		as_list=1,
 		distinct=True,

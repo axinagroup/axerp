@@ -74,7 +74,7 @@ git tag --sort=-version:refname | grep axerp | head -3
 bash scripts/sync_upstream.sh v16.26.2
 ```
 
-This script handles fetching, merging, rebranding (ERPNext → AXERP), committing, tagging as `v16.26.2-axerp`, and force-pushing to origin.
+This script handles fetching, merging, rebranding (ERPNext → AXERP), committing, tagging as `<tag>-axerp` (currently `v16.36.1-axerp`), and force-pushing to origin.
 
 ## Critical: erpnext_integrations Module — Do NOT Rebrand
 

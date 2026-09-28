@@ -18,6 +18,7 @@ from erpnext.manufacturing.doctype.work_order.work_order import (
 	StockOverProductionError,
 	close_work_order,
 	make_job_card,
+	make_material_request,
 	make_stock_entry,
 	make_stock_return_entry,
 	stop_unstop,
@@ -686,6 +687,28 @@ class TestWorkOrder(AXERPTestSuite):
 		ste = make_stock_entry(wo_order.name, "Material Transfer for Manufacture", wo_order.qty)
 		self.assertEqual(ste.get("items")[0].get("cost_center"), "_Test Cost Center - _TC")
 
+	@AXERPTestSuite.change_settings("Manufacturing Settings", {"make_serial_no_batch_from_work_order": 0})
+	def test_cost_center_for_manufacture_falls_back_to_item_group_default(self):
+		# "_Test Item Group" is master data with buying_cost_center already set to
+		# "_Test Cost Center 2 - _TC" for "_Test Company"; only the FG item and its
+		# BOM need to be created, since no existing item in that group has one.
+		fg_item = make_item(
+			"_Test FG Item For Item Group Cost Center",
+			{"is_stock_item": 1, "item_group": "_Test Item Group", "include_item_in_manufacturing": 1},
+		)
+
+		if not frappe.db.exists("BOM", {"item": fg_item.name, "is_active": 1, "is_default": 1}):
+			make_bom(item=fg_item.name, raw_materials=["_Test Item"])
+
+		wo_order = make_wo_order_test_record(
+			production_item=fg_item.name, skip_transfer=1, source_warehouse="_Test Warehouse - _TC"
+		)
+		ste = frappe.get_doc(make_stock_entry(wo_order.name, "Manufacture", wo_order.qty))
+		ste.insert()
+
+		fg_row = next(d for d in ste.items if d.is_finished_item)
+		self.assertEqual(fg_row.cost_center, "_Test Cost Center 2 - _TC")
+
 	def test_operation_time_with_batch_size(self):
 		fg_item = "Test Batch Size Item For BOM"
 		rm1 = "Test Batch Size Item RM 1 For BOM"
@@ -1092,7 +1115,7 @@ class TestWorkOrder(AXERPTestSuite):
 
 		stock_entry = frappe.get_doc(make_stock_entry(wo_order.name, "Manufacture", 10))
 		for row in stock_entry.items:
-			if row.type or row.is_legacy_scrap_item:
+			if row.secondary_item_type or row.valuation_type:
 				self.assertEqual(row.qty, 1)
 
 		# Partial Job Card 1 with qty 10
@@ -1104,7 +1127,7 @@ class TestWorkOrder(AXERPTestSuite):
 
 		stock_entry = frappe.get_doc(make_stock_entry(wo_order.name, "Manufacture", 10))
 		for row in stock_entry.items:
-			if row.type or row.is_legacy_scrap_item:
+			if row.secondary_item_type or row.valuation_type:
 				self.assertEqual(row.qty, 2)
 
 		# Partial Job Card 2 with qty 10
@@ -1524,6 +1547,97 @@ class TestWorkOrder(AXERPTestSuite):
 
 		work_order.reload()
 		self.assertEqual(work_order.material_transferred_for_manufacturing, 2.0)
+
+	def test_work_order_material_request_and_bom_details(self):
+		from erpnext.stock.doctype.material_request.material_request import (
+			make_stock_entry as mr_to_stock_entry,
+		)
+
+		work_order = make_wo_order_test_record(
+			planned_start_date=now(), qty=2, source_warehouse="Stores - _TC"
+		)
+
+		mr = make_material_request(work_order.name)
+		mr.schedule_date = today()
+		for item in mr.items:
+			item.schedule_date = today()
+		mr.submit()
+		self.assertEqual(mr.work_order, work_order.name)
+
+		ste = mr_to_stock_entry(mr.name)
+		self.assertEqual(ste.purpose, "Material Transfer for Manufacture")
+		self.assertEqual(ste.work_order, work_order.name)
+		self.assertEqual(ste.from_bom, 1.0)
+		self.assertEqual(ste.bom_no, work_order.bom_no)
+		self.assertEqual(ste.fg_completed_qty, 0.0)
+
+	def test_status_in_process_when_only_one_required_item_transferred_via_material_request(self):
+		"""Same bottleneck scenario as the Pick List flow, but the intermediate document is a
+		Material Request created directly from the Work Order: min-fraction keeps
+		material_transferred_for_manufacturing at 0, but the work order must still move to
+		In Process because material is already in WIP.
+		"""
+		from erpnext.stock.doctype.material_request.material_request import (
+			make_stock_entry as mr_to_stock_entry,
+		)
+
+		work_order = make_wo_order_test_record(
+			planned_start_date=now(), qty=2, source_warehouse="Stores - _TC"
+		)
+		test_stock_entry.make_stock_entry(
+			item_code="_Test Item", target="Stores - _TC", qty=10, basic_rate=5000.0
+		)
+		test_stock_entry.make_stock_entry(
+			item_code="_Test Item Home Desktop 100", target="Stores - _TC", qty=10, basic_rate=1000.0
+		)
+
+		mr = make_material_request(work_order.name)
+		mr.schedule_date = today()
+		# request only _Test Item; the other required item is left off this material request
+		mr.items = [item for item in mr.items if item.item_code == "_Test Item"]
+		for item in mr.items:
+			item.schedule_date = today()
+		mr.submit()
+
+		stock_entry = frappe.get_doc(mr_to_stock_entry(mr.name))
+		self.assertEqual(stock_entry.fg_completed_qty, 0.0)
+		stock_entry.submit()
+
+		work_order.reload()
+		self.assertEqual(work_order.material_transferred_for_manufacturing, 0.0)
+		self.assertEqual(work_order.status, "In Process")
+
+	def test_status_in_process_when_only_one_required_item_transferred_via_pick_list(self):
+		"""Stock Entry created from a Pick List that picked only one of the required items:
+		min-fraction keeps material_transferred_for_manufacturing at 0, but the work order must
+		still move to In Process because material is already in WIP."""
+		from erpnext.manufacturing.doctype.work_order.work_order import create_pick_list
+		from erpnext.stock.doctype.pick_list.pick_list import create_stock_entry
+
+		work_order = make_wo_order_test_record(
+			planned_start_date=now(), qty=2, source_warehouse="Stores - _TC"
+		)
+		test_stock_entry.make_stock_entry(
+			item_code="_Test Item", target="Stores - _TC", qty=10, basic_rate=5000.0
+		)
+		test_stock_entry.make_stock_entry(
+			item_code="_Test Item Home Desktop 100", target="Stores - _TC", qty=10, basic_rate=1000.0
+		)
+
+		pick_list = create_pick_list(work_order.name, for_qty=work_order.qty)
+		# pick only _Test Item; the other required item is left out of this pick list
+		pick_list.pick_manually = 1
+		pick_list.locations = [loc for loc in pick_list.locations if loc.item_code == "_Test Item"]
+		pick_list.save()
+		pick_list.submit()
+
+		stock_entry = frappe.get_doc(create_stock_entry(frappe.as_json(pick_list.as_dict())))
+		self.assertEqual(stock_entry.fg_completed_qty, 0.0)
+		stock_entry.submit()
+
+		work_order.reload()
+		self.assertEqual(work_order.material_transferred_for_manufacturing, 0.0)
+		self.assertEqual(work_order.status, "In Process")
 
 	def test_backflushed_batch_raw_materials_based_on_transferred(self):
 		frappe.db.set_single_value(
@@ -2253,7 +2367,7 @@ class TestWorkOrder(AXERPTestSuite):
 		self.assertTrue(se_doc.additional_costs)
 		secondary_items = []
 		for item in se_doc.items:
-			if item.type or item.is_legacy_scrap_item:
+			if item.secondary_item_type or item.valuation_type:
 				secondary_items.append(item.item_code)
 
 		self.assertEqual(
@@ -2718,7 +2832,7 @@ class TestWorkOrder(AXERPTestSuite):
 		# Secondary/Scrap item: should be taken from scrap warehouse in disassembly
 		scrap_row = next((i for i in stock_entry.items if i.item_code == scrap_item), None)
 		self.assertIsNotNone(scrap_row)
-		self.assertEqual(scrap_row.type, "Scrap")
+		self.assertEqual(scrap_row.secondary_item_type, "Scrap")
 		self.assertTrue(scrap_row.s_warehouse)
 		self.assertFalse(scrap_row.t_warehouse)
 		self.assertEqual(scrap_row.s_warehouse, wo.scrap_warehouse)
@@ -3244,6 +3358,42 @@ class TestWorkOrder(AXERPTestSuite):
 
 		frappe.db.set_single_value("Manufacturing Settings", "validate_components_quantities_per_bom", 0)
 
+	def test_transferred_qty_sums_item_and_its_alternate(self):
+		# Base item + its alternate transfers must sum onto the required row, not overwrite.
+		fg_item = "Test FG Item For Alternate Transferred Qty"
+		source_warehouse = "Stores - _TC"
+		raw_material = "Test RM For Alternate Transferred Qty"
+		alternate_item = "Alternate Test RM For Alternate Transferred Qty"
+
+		make_item(fg_item, {"is_stock_item": 1})
+		for item in [raw_material, alternate_item]:
+			make_item(item, {"is_stock_item": 1, "allow_alternative_item": 1})
+			test_stock_entry.make_stock_entry(item_code=item, target=source_warehouse, qty=10, basic_rate=100)
+
+		frappe.get_doc(
+			{
+				"doctype": "Item Alternative",
+				"item_code": raw_material,
+				"alternative_item_code": alternate_item,
+				"two_way": 1,
+			}
+		).insert()
+
+		make_bom(item=fg_item, source_warehouse=source_warehouse, raw_materials=[raw_material])
+		wo = make_wo_order_test_record(item=fg_item, qty=10, source_warehouse=source_warehouse)
+
+		# 6 as the base item
+		frappe.get_doc(make_stock_entry(wo.name, "Material Transfer for Manufacture", 6)).submit()
+		# 4 as the alternate item, linked back to the base
+		alt_transfer = frappe.get_doc(make_stock_entry(wo.name, "Material Transfer for Manufacture", 4))
+		alt_transfer.items[0].item_code = alternate_item
+		alt_transfer.items[0].original_item = raw_material
+		alt_transfer.submit()
+
+		wo.reload()
+		self.assertEqual(wo.required_items[0].transferred_qty, 10)
+		self.assertEqual(wo.material_transferred_for_manufacturing, 10)
+
 	def test_components_qty_for_bom_based_manufacture_entry(self):
 		frappe.db.set_single_value("Manufacturing Settings", "backflush_raw_materials_based_on", "BOM")
 		frappe.db.set_single_value("Manufacturing Settings", "validate_components_quantities_per_bom", 1)
@@ -3708,6 +3858,45 @@ class TestWorkOrder(AXERPTestSuite):
 		transfer_entry.save()
 
 		self.assertRaises(frappe.ValidationError, transfer_entry.submit)
+
+	@AXERPTestSuite.change_settings(
+		"Stock Settings",
+		{"enable_stock_reservation": 1, "allow_partial_reservation": 1},
+	)
+	def test_partial_reservation_records_full_voucher_qty(self):
+		# Regression: a short reservation must keep voucher_qty as the full requirement.
+		from erpnext.stock.doctype.stock_entry.stock_entry_utils import (
+			make_stock_entry as make_stock_entry_test_record,
+		)
+
+		production_item = "Test Partial Reservation FG"
+		rm_item = "Test Partial Reservation RM"
+		source_warehouse = "Stores - _TC"
+
+		make_item(production_item, {"is_stock_item": 1})
+		make_item(rm_item, {"is_stock_item": 1})
+
+		make_bom(item=production_item, source_warehouse=source_warehouse, raw_materials=[rm_item])
+
+		# Only 6 units on hand while the Work Order needs 10.
+		make_stock_entry_test_record(item_code=rm_item, target=source_warehouse, qty=6, basic_rate=100)
+
+		wo = make_wo_order_test_record(
+			item=production_item,
+			qty=10,
+			reserve_stock=1,
+			source_warehouse=source_warehouse,
+		)
+
+		sre = frappe.get_all(
+			"Stock Reservation Entry",
+			filters={"voucher_no": wo.name, "docstatus": 1},
+			fields=["voucher_qty", "reserved_qty", "status"],
+		)
+		self.assertEqual(len(sre), 1)
+		self.assertEqual(sre[0].reserved_qty, 6)
+		self.assertEqual(sre[0].voucher_qty, 10)
+		self.assertEqual(sre[0].status, "Partially Reserved")
 
 	def test_auto_stock_reservation_for_batched_raw_material(self):
 		from erpnext.stock.doctype.stock_entry.stock_entry_utils import (
@@ -4595,11 +4784,12 @@ class TestWorkOrder(AXERPTestSuite):
 		bom.append(
 			"secondary_items",
 			{
-				"type": "Scrap",
+				"secondary_item_type": "Scrap",
 				"item_code": scrap_item,
 				"item_name": scrap_item,
 				"qty": 3,
 				"cost_allocation_per": 25,
+				"valuation_type": "% of Component Cost",
 				"process_loss_per": 0,
 			},
 		)
@@ -4616,7 +4806,7 @@ class TestWorkOrder(AXERPTestSuite):
 		self.assertEqual(len(secondary_items), 1)
 		row = secondary_items[0]
 		self.assertEqual(row.item_code, scrap_item)
-		self.assertEqual(row.type, "Scrap")
+		self.assertEqual(row.secondary_item_type, "Scrap")
 		# data is fetched from the BOM (carries bom_qty)
 		self.assertEqual(flt(row.bom_qty), 8.0)
 		# qty = (bom_secondary_qty / bom_qty) * wo_qty = (3 / 8) * 20 = 7.5
@@ -4643,11 +4833,12 @@ class TestWorkOrder(AXERPTestSuite):
 		bom.append(
 			"secondary_items",
 			{
-				"type": "Scrap",
+				"secondary_item_type": "Scrap",
 				"item_code": scrap_item,
 				"item_name": scrap_item,
 				"qty": 3,
 				"cost_allocation_per": 25,
+				"valuation_type": "% of Component Cost",
 				"process_loss_per": 0,
 			},
 		)
@@ -4672,7 +4863,7 @@ class TestWorkOrder(AXERPTestSuite):
 		manufacture_entry = frappe.get_doc(make_stock_entry(wo_order.name, "Manufacture", 8))
 		manufacture_entry.submit()
 
-		generated_row = next(row for row in manufacture_entry.items if row.type == "Scrap")
+		generated_row = next(row for row in manufacture_entry.items if row.secondary_item_type == "Scrap")
 
 		wo_order.reload()
 		secondary_items = wo_order.secondary_items
@@ -4685,6 +4876,24 @@ class TestWorkOrder(AXERPTestSuite):
 		self.assertEqual(flt(row.amount, 6), flt(generated_row.amount, 6))
 		# generated qty (3.0 for 8 units) differs from the BOM-scaled qty (7.5 for 20 units)
 		self.assertEqual(flt(row.qty, 6), 3.0)
+
+	def test_wip_warehouse_required_when_tracking_semi_finished_goods(self):
+		wo = frappe.new_doc("Work Order")
+		wo.track_semi_finished_goods = 1
+		wo.skip_transfer = 0
+		wo.fg_warehouse = "_Test Warehouse 1 - _TC"
+
+		self.assertRaises(frappe.ValidationError, wo.validate_warehouse)
+
+		wo.wip_warehouse = "_Test Warehouse - _TC"
+		wo.validate_warehouse()
+
+		# the top-level target warehouse stays optional; operations may carry their own
+		wo.fg_warehouse = None
+		wo.validate_warehouse()
+
+		wo.track_semi_finished_goods = 0
+		self.assertRaises(frappe.ValidationError, wo.validate_warehouse)
 
 
 def get_reserved_entries(voucher_no, warehouse=None):
@@ -4819,7 +5028,15 @@ def prepare_boms_for_sub_assembly_test():
 			do_not_submit=True,
 		)
 
-		bom.append("secondary_items", {"item_code": "Test Final Scrap Item 1", "qty": 1, "is_legacy": 1})
+		bom.append(
+			"secondary_items",
+			{
+				"item_code": "Test Final Scrap Item 1",
+				"secondary_item_type": "Scrap",
+				"qty": 1,
+				"valuation_type": "Valuation Rate",
+			},
+		)
 
 		bom.submit()
 
@@ -4832,7 +5049,15 @@ def prepare_boms_for_sub_assembly_test():
 			do_not_submit=True,
 		)
 
-		bom.append("secondary_items", {"item_code": "Test Final Scrap Item 2", "qty": 1, "is_legacy": 1})
+		bom.append(
+			"secondary_items",
+			{
+				"item_code": "Test Final Scrap Item 2",
+				"secondary_item_type": "Scrap",
+				"qty": 1,
+				"valuation_type": "Valuation Rate",
+			},
+		)
 
 		bom.submit()
 

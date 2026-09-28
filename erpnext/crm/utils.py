@@ -150,6 +150,10 @@ def link_open_events(ref_doctype, ref_docname, doc):
 
 @frappe.whitelist()
 def get_open_activities(ref_doctype, ref_docname):
+	# both arguments are caller supplied and the ToDo/Event rows are read with get_all, so the
+	# referenced document decides who may see its activities. doc= applies User Permissions.
+	frappe.has_permission(ref_doctype, doc=ref_docname, throw=True)
+
 	tasks = get_open_todos(ref_doctype, ref_docname)
 	events = get_open_events(ref_doctype, ref_docname)
 	tasks_history = get_closed_todos(ref_doctype, ref_docname)
@@ -189,6 +193,7 @@ def get_filtered_todos(ref_doctype, ref_docname, status: str | tuple[str, str]):
 			"allocated_to",
 			"date",
 		],
+		order_by="date asc",
 	)
 
 
@@ -218,6 +223,7 @@ def get_filtered_events(ref_doctype, ref_docname, open: bool):
 			& (event_link.reference_docname == ref_docname)
 			& (event_status_filter)
 		)
+		.orderby(event.starts_on)
 	)
 	data = query.run(as_dict=True)
 
@@ -253,7 +259,10 @@ class CRMNote(Document):
 		notify_mentions(self.doctype, self.name, note)
 
 	@frappe.whitelist()
-	def edit_note(self, note, row_id):
+	def edit_note(self, note: str, row_id: str):
+		# db_update() skips the write check that save() does in add_note/delete_note
+		self.check_permission("write")
+
 		for d in self.notes:
 			if cstr(d.name) == row_id:
 				d.note = note

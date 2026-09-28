@@ -517,6 +517,7 @@ class SalesInvoice(SellingController):
 			self.update_billing_status_for_zero_amount_refdoc("Delivery Note")
 			self.update_billing_status_for_zero_amount_refdoc("Sales Order")
 			self.check_credit_limit()
+			self.check_overdue_billing_threshold()
 
 		if cint(self.is_pos) != 1 and not self.is_return:
 			self.update_against_document_in_jv()
@@ -777,6 +778,11 @@ class SalesInvoice(SellingController):
 			for pos_invoice in pos_invoices:
 				pos_invoice_doc = frappe.get_doc("POS Invoice", pos_invoice)
 				pos_invoice_doc.cancel()
+
+	def check_overdue_billing_threshold(self):
+		from erpnext.selling.doctype.customer.customer import check_overdue_billing_threshold
+
+		check_overdue_billing_threshold(self.customer, self.company)
 
 	@frappe.whitelist()
 	def set_missing_values(self, for_validate=False):
@@ -1871,7 +1877,7 @@ class SalesInvoice(SellingController):
 
 			for payment_mode in self.payments:
 				if skip_change_gl_entries and payment_mode.account == self.account_for_change_amount:
-					payment_mode.base_amount -= flt(self.change_amount)
+					payment_mode.base_amount -= flt(self.base_change_amount)
 
 				against_voucher = self.name
 				if self.is_return and self.return_against and not self.update_outstanding_for_self:
@@ -2854,9 +2860,28 @@ def make_inter_company_transaction(doctype, source_name, target_doc=None):
 
 @frappe.whitelist()
 def get_received_items(reference_name: str, doctype: str, reference_fieldname: str):
-	reference_field = "inter_company_invoice_reference"
-	if doctype == "Purchase Order":
-		reference_field = "inter_company_order_reference"
+	# The only two targets and reference fields the callers use. Stating them rejects a caller-supplied
+	# doctype that would otherwise be filtered on a column it does not have.
+	reference_fields = {
+		"Purchase Invoice": ("inter_company_invoice_reference", "Sales Invoice", "sales_invoice_item"),
+		"Purchase Order": ("inter_company_order_reference", "Sales Order", "sales_order_item"),
+	}
+	if doctype not in reference_fields:
+		frappe.throw(_("Invalid doctype {0}").format(doctype), frappe.PermissionError)
+
+	reference_field, source_doctype, expected_fieldname = reference_fields[doctype]
+
+	# The targets belong to the counterpart company and the caller may legitimately not read them, so
+	# the source document decides access. doc= brings User Permissions in.
+	frappe.has_permission(source_doctype, doc=reference_name, throw=True)
+
+	# `reference_fieldname` becomes a selected column and the result key, so it has to be this target's
+	# own reference field: any other item-table column would be returned from unauthorised rows.
+	if reference_fieldname != expected_fieldname:
+		frappe.throw(
+			_("{0} is not a valid reference field for {1}").format(reference_fieldname, doctype),
+			frappe.ValidationError,
+		)
 
 	filters = {
 		reference_field: reference_name,
@@ -3156,8 +3181,6 @@ def create_dunning(source_name, target_doc=None, ignore_permissions=False):
 	from frappe.model.mapper import get_mapped_doc
 
 	def postprocess_dunning(source, target):
-		from erpnext.accounts.doctype.dunning.dunning import get_dunning_letter_text
-
 		dunning_type = frappe.db.exists("Dunning Type", {"is_default": 1, "company": source.company})
 		if dunning_type:
 			dunning_type = frappe.get_doc("Dunning Type", dunning_type)
@@ -3166,14 +3189,8 @@ def create_dunning(source_name, target_doc=None, ignore_permissions=False):
 			target.dunning_fee = dunning_type.dunning_fee
 			target.income_account = dunning_type.income_account
 			target.cost_center = dunning_type.cost_center
-			letter_text = get_dunning_letter_text(
-				dunning_type=dunning_type.name, doc=target.as_dict(), language=source.language
-			)
-
-			if letter_text:
-				target.body_text = letter_text.get("body_text")
-				target.closing_text = letter_text.get("closing_text")
-				target.language = letter_text.get("language")
+			target.language = source.language
+			target.get_dunning_letter_text()
 
 		# update outstanding from doc
 		if source.payment_schedule and len(source.payment_schedule) == 1:

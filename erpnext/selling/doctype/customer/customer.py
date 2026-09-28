@@ -11,11 +11,12 @@ from frappe.contacts.address_and_contact import (
 	delete_contact_and_address,
 	load_address_and_contact,
 )
+from frappe.model.document import Document
 from frappe.model.mapper import get_mapped_doc
 from frappe.model.naming import set_name_by_naming_series, set_name_from_naming_options
 from frappe.model.utils.rename_doc import update_linked_doctypes
 from frappe.query_builder import Field, functions
-from frappe.utils import cint, cstr, flt, get_formatted_email, today
+from frappe.utils import cint, cstr, flt, fmt_money, get_formatted_email, get_link_to_form, getdate, today
 from frappe.utils.user import get_users_with_role
 
 from erpnext.accounts.party import (
@@ -23,7 +24,10 @@ from erpnext.accounts.party import (
 	validate_party_accounts,
 	validate_party_currency_before_merging,
 )
-from erpnext.controllers.website_list_for_contact import add_role_for_portal_user
+from erpnext.controllers.website_list_for_contact import (
+	add_role_for_portal_user,
+	link_portal_users_to_contacts,
+)
 from erpnext.utilities.transaction_base import TransactionBase
 
 
@@ -190,7 +194,8 @@ class Customer(TransactionBase):
 				self.loyalty_program_tier = customer.loyalty_program_tier
 
 		if self.sales_team:
-			if sum(member.allocated_percentage or 0 for member in self.sales_team) != 100:
+			total = sum(flt(member.allocated_percentage) for member in self.sales_team)
+			if flt(total, self.precision("allocated_percentage", "sales_team")) != 100:
 				frappe.throw(_("Total contribution percentage should be equal to 100"))
 
 	@frappe.whitelist()
@@ -200,17 +205,21 @@ class Customer(TransactionBase):
 		self.credit_limits = []
 		self.payment_terms = self.default_price_list = ""
 
-		tables = [["accounts", "account"], ["credit_limits", "credit_limit"]]
+		tables = [
+			["accounts", ["account"]],
+			["credit_limits", ["credit_limit", "overdue_billing_threshold"]],
+		]
 		fields = ["payment_terms", "default_price_list"]
 
 		for row in tables:
-			table, field = row[0], row[1]
+			table, table_fields = row[0], row[1]
 			if not doc.get(table):
 				continue
 
 			for entry in doc.get(table):
 				child = self.append(table)
-				child.update({"company": entry.company, field: entry.get(field)})
+				child.update({"company": entry.company})
+				child.update({field: entry.get(field) for field in table_fields})
 
 		for field in fields:
 			if not doc.get(field):
@@ -252,10 +261,15 @@ class Customer(TransactionBase):
 		)
 
 		if internal_customer:
+			internal_customer_link = get_link_to_form("Customer", internal_customer)
 			frappe.throw(
-				_("Internal Customer for company {0} already exists").format(
-					frappe.bold(self.represents_company)
-				)
+				_(
+					"Internal Customer {0} already exists for {1}. Disable it to make this Customer internal."
+				).format(
+					internal_customer_link,
+					frappe.bold(self.represents_company),
+				),
+				title=_("Internal Customer Already Exists"),
 			)
 
 	def on_update(self):
@@ -271,6 +285,8 @@ class Customer(TransactionBase):
 			self.copy_communication()
 
 		self.update_customer_groups()
+
+		link_portal_users_to_contacts(self)
 
 	def add_role_for_user(self):
 		for portal_user in self.portal_users:
@@ -397,6 +413,9 @@ class Customer(TransactionBase):
 			else:
 				company_record.append(limit.company)
 
+			if not flt(limit.credit_limit):
+				continue
+
 			outstanding_amt = get_customer_outstanding(
 				self.name, limit.company, ignore_outstanding_sales_order=limit.bypass_credit_limit_check
 			)
@@ -444,22 +463,15 @@ class Customer(TransactionBase):
 
 
 @frappe.whitelist()
-def make_quotation(source_name, target_doc=None):
-	def set_missing_values(source, target):
-		_set_missing_values(source, target)
-
+def make_quotation(source_name: str, target_doc: str | Document | None = None) -> Document:
 	target_doc = get_mapped_doc(
 		"Customer",
 		source_name,
 		{"Customer": {"doctype": "Quotation", "field_map": {"name": "party_name"}}},
 		target_doc,
-		set_missing_values,
 	)
 
 	target_doc.quotation_to = "Customer"
-	target_doc.run_method("set_missing_values")
-	target_doc.run_method("set_other_charges")
-	target_doc.run_method("calculate_taxes_and_totals")
 
 	price_list, currency = frappe.db.get_value(
 		"Customer", {"name": source_name}, ["default_price_list", "default_currency"]
@@ -468,6 +480,10 @@ def make_quotation(source_name, target_doc=None):
 		target_doc.selling_price_list = price_list
 	if currency:
 		target_doc.currency = currency
+
+	target_doc.run_method("set_missing_values")
+	target_doc.run_method("set_other_charges")
+	target_doc.run_method("calculate_taxes_and_totals")
 
 	return target_doc
 
@@ -638,11 +654,8 @@ def check_credit_limit(customer, company, ignore_outstanding_sales_order=False, 
 
 			# if the current user does not have permissions to override credit limit,
 			# prompt them to send out an email to the controller users
-			frappe.msgprint(
-				message,
-				title=_("Credit Limit Crossed"),
-				raise_exception=1,
-				primary_action={
+			primary_action = (
+				{
 					"label": "Send Email",
 					"server_action": "erpnext.selling.doctype.customer.customer.send_emails",
 					"hide_on_success": True,
@@ -652,7 +665,16 @@ def check_credit_limit(customer, company, ignore_outstanding_sales_order=False, 
 						"credit_limit": credit_limit,
 						"credit_controller_users_list": credit_controller_users,
 					},
-				},
+				}
+				if frappe.has_permission("Customer", ptype="email", doc=customer)
+				else None
+			)
+
+			frappe.msgprint(
+				message,
+				title=_("Credit Limit Crossed"),
+				raise_exception=1,
+				primary_action=primary_action,
 			)
 
 
@@ -660,11 +682,131 @@ def check_credit_limit(customer, company, ignore_outstanding_sales_order=False, 
 def send_emails(customer, customer_outstanding, credit_limit, credit_controller_users_list):
 	if isinstance(credit_controller_users_list, str):
 		credit_controller_users_list = json.loads(credit_controller_users_list)
+	frappe.has_permission("Customer", ptype="email", doc=customer, throw=True)
 	subject = _("Credit limit reached for customer {0}").format(customer)
 	message = _("Credit limit has been crossed for customer {0} ({1}/{2})").format(
 		customer, customer_outstanding, credit_limit
 	)
 	frappe.sendmail(recipients=credit_controller_users_list, subject=subject, message=message)
+
+
+def check_overdue_billing_threshold(customer: str, company: str) -> None:
+	if not frappe.get_single_value("Accounts Settings", "enable_overdue_billing_threshold"):
+		return
+
+	threshold = get_overdue_billing_threshold(customer, company)
+	if not threshold:
+		return
+
+	overdue_amount = get_customer_overdue_amount(customer, company)
+	if overdue_amount <= threshold:
+		return
+
+	bypass_role = frappe.get_single_value("Accounts Settings", "role_allowed_to_bypass_overdue_billing")
+	if bypass_role and bypass_role in frappe.get_roles():
+		return
+
+	company_currency = frappe.get_cached_value("Company", company, "default_currency")
+	frappe.throw(
+		_("Overdue Limit crossed for customer {0}. Overdue amount {1} exceeds the allowed limit {2}.").format(
+			customer,
+			fmt_money(overdue_amount, currency=company_currency),
+			fmt_money(threshold, currency=company_currency),
+		),
+		title=_("Overdue Limit Crossed"),
+	)
+
+
+def get_overdue_billing_threshold(customer: str, company: str) -> float:
+	"""Overdue limit set on the customer, falling back to its customer group."""
+	threshold = frappe.db.get_value(
+		"Customer Credit Limit",
+		{"parent": customer, "parenttype": "Customer", "company": company},
+		"overdue_billing_threshold",
+	)
+
+	if not threshold:
+		customer_group = frappe.get_cached_value("Customer", customer, "customer_group")
+		threshold = frappe.db.get_value(
+			"Customer Credit Limit",
+			{"parent": customer_group, "parenttype": "Customer Group", "company": company},
+			"overdue_billing_threshold",
+		)
+
+	return flt(threshold)
+
+
+def get_customer_overdue_amount(customer: str, company: str) -> float:
+	"""Amount the customer owes past its due date, in company currency.
+
+	Reads the Payment Ledger, the same source as `outstanding_amount`, so this agrees
+	with the Overdue status the invoice list already shows.
+	"""
+	invoices = get_outstanding_invoices_for_customer(customer, company)
+	if not invoices:
+		return 0.0
+
+	payable_amounts = get_past_due_payable_amounts([d.name for d in invoices])
+	return flt(sum(get_overdue_portion(d, payable_amounts.get(d.name)) for d in invoices))
+
+
+def get_outstanding_invoices_for_customer(customer: str, company: str) -> list[frappe._dict]:
+	from frappe.query_builder.functions import Sum
+
+	ple = frappe.qb.DocType("Payment Ledger Entry")
+	sales_invoice = frappe.qb.DocType("Sales Invoice")
+
+	# the Payment Ledger, not the GL, carries allocations made after submit (reconciled advances).
+	# `amount` is booked in company currency, so this is comparable to the overdue limit.
+	outstanding = Sum(ple.amount)
+
+	return (
+		frappe.qb.from_(ple)
+		.inner_join(sales_invoice)
+		.on(sales_invoice.name == ple.against_voucher_no)
+		.select(
+			sales_invoice.name,
+			sales_invoice.due_date,
+			sales_invoice.base_grand_total,
+			outstanding.as_("outstanding"),
+		)
+		.where(ple.party_type == "Customer")
+		.where(ple.party == customer)
+		.where(ple.company == company)
+		.where(ple.delinked == 0)
+		.where(ple.against_voucher_type == "Sales Invoice")
+		.groupby(sales_invoice.name, sales_invoice.due_date, sales_invoice.base_grand_total)
+		.having(outstanding > 0)
+	).run(as_dict=True)
+
+
+def get_past_due_payable_amounts(invoices: list[str]) -> dict[str, float]:
+	from frappe.query_builder.functions import Sum
+
+	payment_schedule = frappe.qb.DocType("Payment Schedule")
+
+	rows = (
+		frappe.qb.from_(payment_schedule)
+		.select(payment_schedule.parent, Sum(payment_schedule.base_payment_amount).as_("payable"))
+		.where(payment_schedule.parenttype == "Sales Invoice")
+		.where(payment_schedule.parent.isin(invoices))
+		.where(payment_schedule.due_date < getdate())
+		.groupby(payment_schedule.parent)
+	).run(as_dict=True)
+
+	return {d.parent: flt(d.payable) for d in rows}
+
+
+def get_overdue_portion(invoice: frappe._dict, payable_amount: float | None) -> float:
+	outstanding = flt(invoice.outstanding)
+
+	# No payable amount means either a schedule-less invoice (POS, opening) or one whose terms are
+	# all still in the future. Both are answered by the invoice due date, which is the last term.
+	if payable_amount is None:
+		return outstanding if invoice.due_date and getdate(invoice.due_date) < getdate() else 0.0
+
+	paid = flt(invoice.base_grand_total) - outstanding
+	return min(max(payable_amount - paid, 0.0), outstanding)
 
 
 def get_customer_outstanding(customer, company, ignore_outstanding_sales_order=False, cost_center=None):
@@ -868,6 +1010,15 @@ def make_address(args, is_primary_address=1, is_shipping_address=1):
 def get_customer_primary(doctype, txt, searchfield, start, page_len, filters):
 	customer = filters.get("customer")
 	type = filters.get("type")
+
+	# `type` is caller-supplied and reaches qb.DocType(), so any doctype could be joined to Dynamic
+	# Link. The two pickers that call this send only these two values.
+	if type not in ("Contact", "Address"):
+		frappe.throw(_("Invalid type"), frappe.PermissionError)
+
+	# authorise the party, not Contact/Address: the `if_owner` row on Address would empty the picker rather than error
+	frappe.has_permission("Customer", doc=customer, throw=True)
+
 	type_doctype = qb.DocType(type)
 	dlink = qb.DocType("Dynamic Link")
 

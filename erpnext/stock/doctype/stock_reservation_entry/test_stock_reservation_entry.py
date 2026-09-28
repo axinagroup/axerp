@@ -12,9 +12,9 @@ from erpnext.stock.doctype.item.test_item import make_item
 from erpnext.stock.doctype.stock_entry.stock_entry import StockEntry
 from erpnext.stock.doctype.stock_entry.test_stock_entry import make_stock_entry
 from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
+	_get_stock_reservation_entries_for_voucher,
 	cancel_stock_reservation_entries,
 	get_sre_reserved_qty_details_for_voucher,
-	get_stock_reservation_entries_for_voucher,
 	has_reserved_stock,
 )
 from erpnext.stock.utils import get_stock_balance
@@ -284,7 +284,7 @@ class TestStockReservationEntry(AXERPTestSuite):
 			self.assertTrue(has_reserved_stock("Sales Order", so.name))
 
 			for item in so.items:
-				sre_details = get_stock_reservation_entries_for_voucher(
+				sre_details = _get_stock_reservation_entries_for_voucher(
 					"Sales Order", so.name, item.name, fields=["reserved_qty", "status"]
 				)[0]
 				self.assertEqual(item.stock_reserved_qty, sre_details.reserved_qty)
@@ -354,7 +354,7 @@ class TestStockReservationEntry(AXERPTestSuite):
 			dn1.submit()
 
 			for item in so.items:
-				sre_details = get_stock_reservation_entries_for_voucher(
+				sre_details = _get_stock_reservation_entries_for_voucher(
 					"Sales Order", so.name, item.name, fields=["delivered_qty", "status"]
 				)[0]
 				self.assertGreater(sre_details.delivered_qty, 0)
@@ -371,7 +371,7 @@ class TestStockReservationEntry(AXERPTestSuite):
 				dn2.submit()
 
 			for item in so.items:
-				sre_details = get_stock_reservation_entries_for_voucher(
+				sre_details = _get_stock_reservation_entries_for_voucher(
 					"Sales Order",
 					so.name,
 					item.name,
@@ -415,7 +415,7 @@ class TestStockReservationEntry(AXERPTestSuite):
 		so.load_from_db()
 
 		for item in so.items:
-			sre_details = get_stock_reservation_entries_for_voucher(
+			sre_details = _get_stock_reservation_entries_for_voucher(
 				"Sales Order", so.name, item.name, fields=["status", "reserved_qty"]
 			)[0]
 
@@ -430,7 +430,7 @@ class TestStockReservationEntry(AXERPTestSuite):
 		dn.submit()
 
 		for item in so.items:
-			sre_details = get_stock_reservation_entries_for_voucher(
+			sre_details = _get_stock_reservation_entries_for_voucher(
 				"Sales Order", so.name, item.name, fields=["status", "delivered_qty", "reserved_qty"]
 			)[0]
 
@@ -478,7 +478,7 @@ class TestStockReservationEntry(AXERPTestSuite):
 		so.load_from_db()
 
 		for item in so.items:
-			sre_details = get_stock_reservation_entries_for_voucher(
+			sre_details = _get_stock_reservation_entries_for_voucher(
 				"Sales Order",
 				so.name,
 				item.name,
@@ -539,7 +539,7 @@ class TestStockReservationEntry(AXERPTestSuite):
 		so.load_from_db()
 
 		for item in so.items:
-			sre_details = get_stock_reservation_entries_for_voucher(
+			sre_details = _get_stock_reservation_entries_for_voucher(
 				"Sales Order", so.name, item.name, fields=["reserved_qty"]
 			)[0]
 
@@ -697,6 +697,66 @@ class TestStockReservationEntry(AXERPTestSuite):
 		# Test - 1: ValidationError should be thrown as the inwarded stock is reserved.
 		self.assertRaises(frappe.ValidationError, se.cancel)
 
+	@AXERPTestSuite.change_settings(
+		"Stock Settings",
+		{
+			"allow_negative_stock": 0,
+			"enable_stock_reservation": 1,
+			"auto_reserve_serial_and_batch": 1,
+			"pick_serial_and_batch_based_on": "FIFO",
+			"use_serial_batch_fields": 1,
+		},
+	)
+	def test_batch_shared_across_sales_orders_can_be_delivered(self) -> None:
+		# Regression (#57159): one batch reserved by two Sales Orders. Delivering each order's own
+		# reserved unit must not raise Reserved Batch Conflict — the remainder covers the other order.
+		# The batch is set on the row explicitly as the v16 reserved-stock mapper does not carry
+		# the reserved batch onto the Delivery Note row.
+		item_doc = make_batch_item()
+		create_material_receipt(items={item_doc.name: item_doc}, warehouse=self.warehouse, qty=2)
+
+		orders = []
+		for _i in range(2):
+			so = make_sales_order(item_code=item_doc.name, warehouse=self.warehouse, qty=1, rate=100)
+			so.create_stock_reservation_entries()
+			orders.append(so)
+
+		(batch_no,) = get_reserved_batch_nos(orders[0].name) | get_reserved_batch_nos(orders[1].name)
+
+		for so in orders:
+			dn = make_delivery_note(so.name)
+			dn.items[0].batch_no = batch_no
+			dn.save()
+			dn.submit()
+			self.assertEqual(dn.docstatus, 1)
+
+	@AXERPTestSuite.change_settings(
+		"Stock Settings",
+		{
+			"allow_negative_stock": 0,
+			"enable_stock_reservation": 1,
+			"auto_reserve_serial_and_batch": 1,
+			"pick_serial_and_batch_based_on": "FIFO",
+			"use_serial_batch_fields": 1,
+		},
+	)
+	def test_delivery_draining_a_batch_reserved_for_another_sales_order_is_blocked(self) -> None:
+		# Guard for #57159 fix: an order without a reservation must still be blocked from draining
+		# a batch below what another order has reserved from it, even if other batches have stock.
+		item_doc = make_batch_item()
+		create_material_receipt(items={item_doc.name: item_doc}, warehouse=self.warehouse, qty=2)
+		create_material_receipt(items={item_doc.name: item_doc}, warehouse=self.warehouse, qty=2)
+
+		so_a = make_sales_order(item_code=item_doc.name, warehouse=self.warehouse, qty=2, rate=100)
+		so_a.create_stock_reservation_entries()
+		(reserved_batch_no,) = get_reserved_batch_nos(so_a.name)
+
+		so_b = make_sales_order(item_code=item_doc.name, warehouse=self.warehouse, qty=2, rate=100)
+		dn = make_delivery_note(so_b.name)
+		dn.items[0].batch_no = reserved_batch_no
+		dn.save()
+		self.assertRaisesRegex(frappe.ValidationError, "is reserved for", dn.submit)
+
 
 def create_items() -> dict:
 	items_properties = [
@@ -735,6 +795,33 @@ def create_items() -> dict:
 		items[item.name] = item
 
 	return items
+
+
+def make_batch_item():
+	return make_item(
+		properties={
+			"is_stock_item": 1,
+			"valuation_rate": 100,
+			"has_batch_no": 1,
+			"create_new_batch": 1,
+			"batch_number_series": "SRBI-.#####.",
+		}
+	)
+
+
+def get_reserved_batch_nos(sales_order: str) -> set:
+	sre = frappe.qb.DocType("Stock Reservation Entry")
+	sb_entry = frappe.qb.DocType("Serial and Batch Entry")
+
+	batch_nos = (
+		frappe.qb.from_(sre)
+		.inner_join(sb_entry)
+		.on(sre.name == sb_entry.parent)
+		.select(sb_entry.batch_no)
+		.where((sre.voucher_no == sales_order) & (sre.docstatus == 1))
+	).run(pluck=True)
+
+	return set(batch_nos)
 
 
 def create_material_receipt(

@@ -57,7 +57,7 @@ def update_hooks_metadata(hooks_path):
                 elif 'app_email =' in line:
                     f.write(f'app_email = "{NEW_EMAIL}"\n')
                 elif 'source_link =' in line:
-                    f.write(f'source_link = "https://github.com/AXERP/axerp"\n')
+                    f.write('source_link = "https://github.com/axinagroup/axerp"\n')
                 else:
                     # Fallback global replace for the rest of the file
                     # BUT preserve erpnext_integrations
@@ -96,6 +96,12 @@ def smart_replace(content, filename):
     protected = protected.replace('"erpnext_integrations"', f'"{MARKER}"')
     protected = protected.replace("'erpnext_integrations'", f"'{MARKER}'")
     protected = protected.replace('erpnext_integrations', MARKER)
+
+    # Keep the module display name intact in every file type. A plain
+    # ERPNext → AXERP replace turns it into "AXERP Integrations", which
+    # no longer matches the erpnext_integrations package.
+    PHRASE_MARKER = "___PRESERVE_ERPNEXT_INTEGRATIONS_PHRASE___"
+    protected = protected.replace(PRESERVE_INTEGRATIONS_MODULE, PHRASE_MARKER)
     
     # Special handling for modules.txt
     if filename == 'modules.txt':
@@ -139,6 +145,7 @@ def smart_replace(content, filename):
     
     # Restore all protected erpnext_integrations references
     protected = protected.replace(MARKER, PRESERVE_PYTHON_MODULE)
+    protected = protected.replace(PHRASE_MARKER, PRESERVE_INTEGRATIONS_MODULE)
     
     # Restore protected escape sequences in ALL files
     protected = protected.replace(NEWLINE_MARKER, '\\n')
@@ -243,9 +250,10 @@ def update_fork_ownership(root_dir):
         with open(tm_path, "r", encoding="utf-8") as f:
             content = f.read()
         # Replace Frappe co-ownership with sole Axina ownership
+        publisher = NEW_PUBLISHER.rstrip(".")
         content = re.sub(
-            r'trademarks of [^.]+\.',
-            f'trademarks of {NEW_PUBLISHER}.',
+            r'trademarks of [^.]+(?:\.)+',
+            f'trademarks of {publisher}.',
             content,
             count=1,
         )

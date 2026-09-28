@@ -2,9 +2,11 @@
 # For license information, please see license.txt
 
 
+from datetime import date
+
 import frappe
 from frappe import _
-from frappe.utils import get_datetime, get_link_to_form, parse_json
+from frappe.utils import create_batch, get_datetime, get_link_to_form, getdate, parse_json
 
 import erpnext
 from erpnext.accounts.utils import get_currency_precision, get_stock_accounts
@@ -32,6 +34,11 @@ def get_data(report_filters):
 		"company": report_filters.company,
 		"posting_date": ("<=", report_filters.as_on_date),
 	}
+
+	# Optional lower bound: lets callers (e.g. the weekly auto-repost job) scope the scan to the current
+	# fiscal year in the query itself instead of loading every voucher ever posted and filtering later.
+	if report_filters.get("from_date"):
+		filters["posting_date"] = ("between", [report_filters.from_date, report_filters.as_on_date])
 
 	get_currency_precision() or 2
 	stock_ledger_entries = get_stock_ledger_data(report_filters, filters)
@@ -174,14 +181,20 @@ def get_columns(filters):
 
 
 @frappe.whitelist()
-def create_reposting_entries(rows, company):
+def create_reposting_entries(rows: str | list, company: str):
 	if isinstance(rows, str):
 		rows = parse_json(rows)
 
 	entries = []
 
 	item_wh = frappe._dict()
-	vouchers = [row.get("voucher_no") for row in rows]
+	vouchers = [
+		row.get("voucher_no")
+		for row in rows
+		if row.get("voucher_type") not in ["Purchase Receipt", "Purchase Invoice"]
+	]
+	repost_based_on_transaction(rows, company, entries)
+
 	sles = get_stock_ledgers(vouchers)
 	for sle in sles:
 		key = (sle.item_code, sle.warehouse)
@@ -203,7 +216,7 @@ def create_reposting_entries(rows, company):
 					"posting_date": sle.posting_date,
 					"posting_time": sle.posting_time,
 					"company": company,
-					"allow_nagative_stock": 1,
+					"allow_negative_stock": 1,
 				}
 			).submit()
 
@@ -214,3 +227,151 @@ def create_reposting_entries(rows, company):
 	if entries:
 		entries = ", ".join(entries)
 		frappe.msgprint(_("Reposting entries created: {0}").format(entries))
+
+
+def repost_based_on_transaction(rows, company=None, entries=None):
+	if entries is None:
+		entries = []
+
+	duplicate_vouchers = set()
+	for row in rows:
+		if (
+			row.get("voucher_type") == "Purchase Invoice"
+			and frappe.get_cached_value("Purchase Invoice", row.get("voucher_no"), "update_stock") == 0
+		):
+			continue
+
+		if row.get("voucher_type") in ["Purchase Receipt", "Purchase Invoice"]:
+			voucher_key = (row.get("voucher_type"), row.get("voucher_no"))
+			if voucher_key in duplicate_vouchers:
+				continue
+
+			duplicate_vouchers.add(voucher_key)
+			# Isolate each submit in a savepoint: an already-queued repost raises DuplicateEntryError, and on
+			# PostgreSQL a failed insert aborts the whole transaction, killing the rest of the loop (and the
+			# silent weekly job). Rolling back to the savepoint keeps prior/next reposts intact.
+			frappe.db.savepoint("repost_based_on_transaction")
+			try:
+				doc = frappe.get_doc(
+					{
+						"doctype": "Repost Item Valuation",
+						"based_on": "Transaction",
+						"status": "Queued",
+						"voucher_type": row.get("voucher_type"),
+						"voucher_no": row.get("voucher_no"),
+						"posting_date": row.get("posting_date"),
+						"posting_time": row.get("posting_time"),
+						"company": company,
+						"allow_negative_stock": 1,
+						"recalculate_valuation_rate": 1,
+					}
+				).submit()
+
+				entries.append(get_link_to_form("Repost Item Valuation", doc.name))
+			except frappe.DuplicateEntryError:
+				frappe.db.rollback(save_point="repost_based_on_transaction")
+
+
+@frappe.whitelist()
+def create_gl_reposting_entries(rows: str | list, company: str, from_date: str | date | None = None):
+	"""Repost only the accounting ledgers for the selected vouchers posted on or after `from_date`.
+
+	Unlike `create_reposting_entries`, the stock ledgers and the valuation rates are left untouched.
+	This is meant for the case where the stock valuation itself is correct but the General Ledger has
+	drifted away from it, so there is no need to pay for a full (and much slower) revaluation.
+
+	`from_date` bounds how far back the accounting ledgers are rewritten: selected rows posted before
+	it are ignored, so a stale selection cannot reach into an already reconciled period.
+	"""
+
+	frappe.has_permission("Repost Item Valuation", "create", throw=True)
+
+	if isinstance(rows, str):
+		rows = parse_json(rows)
+
+	if not rows:
+		frappe.throw(_("Please select rows to create GL Reposting Entries"))
+
+	if not from_date:
+		frappe.throw(_("Please select the date to repost the accounting ledgers from"))
+
+	from_date = getdate(from_date)
+
+	entries = []
+	processed_vouchers = set()
+
+	# One batched lookup for the whole selection. Checking each row on its own meant a query per
+	# row, which does not hold up when the report is used on the large selections it is meant for.
+	pending_vouchers = get_pending_gl_reposting_vouchers(
+		[(row.get("voucher_type"), row.get("voucher_no")) for row in rows]
+	)
+
+	for row in rows:
+		# Rows posted before the From Date are skipped, so a stale selection cannot rewrite the
+		# accounting ledgers of an already reconciled period.
+		if getdate(row.get("posting_date")) < from_date:
+			continue
+
+		voucher_type, voucher_no = row.get("voucher_type"), row.get("voucher_no")
+
+		# journal entry has not stock stock value, so no need to create a reposting entry for it
+		if voucher_type == "Journal Entry":
+			continue
+
+		# Skip duplicate vouchers in the selection: a single reposting entry is enough to rewrite the accounting ledgers for a given voucher.
+		if (voucher_type, voucher_no) in processed_vouchers:
+			continue
+
+		processed_vouchers.add((voucher_type, voucher_no))
+
+		# A repost queued by an earlier run still has to rewrite this voucher, so queuing another one
+		# now would just rebuild the same ledgers twice.
+		if (voucher_type, voucher_no) in pending_vouchers:
+			continue
+
+		doc = frappe.get_doc(
+			{
+				"doctype": "Repost Item Valuation",
+				"based_on": "Transaction",
+				"status": "Queued",
+				"voucher_type": voucher_type,
+				"voucher_no": voucher_no,
+				"posting_date": row.get("posting_date"),
+				"posting_time": row.get("posting_time"),
+				"company": company,
+				"repost_only_accounting_ledgers": 1,
+			}
+		).submit()
+
+		entries.append(get_link_to_form("Repost Item Valuation", doc.name))
+
+	if entries:
+		if len(entries) > 20:
+			entries = entries[:20] + ["..."]
+
+		frappe.msgprint(_("GL reposting entries created: {0}").format(", ".join(entries)))
+	else:
+		frappe.msgprint(_("No new GL reposting entries were created for the selected rows."))
+
+
+def get_pending_gl_reposting_vouchers(transactions) -> set[tuple[str, str]]:
+	"""Vouchers that already have a GL-only repost queued or running."""
+
+	pending_vouchers = set()
+
+	for chunk in create_batch(transactions, 1000):
+		entries = frappe.get_all(
+			"Repost Item Valuation",
+			filters={
+				"based_on": "Transaction",
+				"repost_only_accounting_ledgers": 1,
+				"docstatus": 1,
+				"status": ("in", ["Queued", "In Progress"]),
+				"voucher_no": ("in", [voucher_no for _, voucher_no in chunk]),
+			},
+			fields=["voucher_type", "voucher_no"],
+		)
+
+		pending_vouchers.update((d.voucher_type, d.voucher_no) for d in entries)
+
+	return pending_vouchers

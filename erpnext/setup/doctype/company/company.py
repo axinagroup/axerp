@@ -80,6 +80,7 @@ class Company(NestedSet):
 		default_operating_cost_account: DF.Link | None
 		default_payable_account: DF.Link | None
 		default_provisional_account: DF.Link | None
+		default_purchase_price_variance_account: DF.Link | None
 		default_receivable_account: DF.Link | None
 		default_sales_contact: DF.Link | None
 		default_scrap_warehouse: DF.Link | None
@@ -97,6 +98,8 @@ class Company(NestedSet):
 		exception_budget_approver_role: DF.Link | None
 		exchange_gain_loss_account: DF.Link | None
 		existing_company: DF.Link | None
+		expenses_added_to_stock_account: DF.Link | None
+		expenses_added_to_stock_contra_account: DF.Link | None
 		fax: DF.Data | None
 		is_group: DF.Check
 		lft: DF.Int
@@ -407,6 +410,7 @@ class Company(NestedSet):
 			)
 			warehouse.flags.ignore_permissions = True
 			warehouse.flags.ignore_mandatory = True
+			warehouse.flags.ignore_inventory_account_validation = True
 			warehouse.insert()
 
 			if wh_detail["is_group"]:
@@ -754,6 +758,13 @@ class Company(NestedSet):
 		"""
 		Trash accounts and cost centers for this company if no gl entry exists
 		"""
+		if frappe.db.get_single_value("Global Defaults", "demo_company") == self.name:
+			frappe.throw(
+				_("{0} is the site's Demo Company and cannot be deleted directly. Use {1} instead.").format(
+					bold(self.name), bold(_("Delete Demo Data"))
+				)
+			)
+
 		NestedSet.validate_if_child_exists(self)
 		frappe.utils.nestedset.update_nsm(self)
 
@@ -931,17 +942,14 @@ def get_children(doctype, parent=None, company=None, is_root=False):
 	if parent is None or parent == "All Companies":
 		parent = ""
 
-	return frappe.db.sql(
-		f"""
-		select
-			name as value,
-			is_group as expandable
-		from
-			`tabCompany` comp
-		where
-			ifnull(parent_company, "")={frappe.db.escape(parent)}
-		""",
-		as_dict=1,
+	filters = {"parent_company": parent} if parent else {"parent_company": ["is", "not set"]}
+
+	# get_list, not get_all: it applies the caller's Company User Permissions, so a restricted user
+	# sees only their own companies.
+	return frappe.get_list(
+		"Company",
+		filters=filters,
+		fields=["name as value", "is_group as expandable"],
 	)
 
 
@@ -951,6 +959,10 @@ def add_node():
 
 	args = frappe.form_dict
 	args = make_tree_args(**args)
+
+	# `args` comes straight from form_dict, so without this the caller chooses the doctype created.
+	# insert() would still check permissions, but nothing here is meant to build anything but a Company.
+	args.doctype = "Company"
 
 	if args.parent_company == "All Companies":
 		args.parent_company = None
@@ -1038,6 +1050,11 @@ def get_default_company_address(name, sort_key="is_primary_address", existing_ad
 	if sort_key not in ["is_shipping_address", "is_primary_address"]:
 		return None
 
+	# Same boundary as accounts/custom/address.py::get_shipping_address: `select` denies the portal
+	# identities and costs none of the transaction-writing roles. doc= so the named company is
+	# evaluated and User Permissions apply.
+	frappe.has_permission("Company", ptype="select", doc=name, throw=True)
+
 	out = frappe.db.sql(
 		""" SELECT
 			addr.name, addr.{}
@@ -1071,6 +1088,8 @@ def get_billing_shipping_address(name, billing_address=None, shipping_address=No
 @frappe.whitelist()
 def create_transaction_deletion_request(company):
 	frappe.only_for("System Manager")
+	# User Permission check
+	frappe.has_permission("Company", ptype="delete", doc=company, throw=True)
 
 	from erpnext.setup.doctype.transaction_deletion_record.transaction_deletion_record import (
 		is_deletion_doc_running,
@@ -1079,6 +1098,7 @@ def create_transaction_deletion_request(company):
 	is_deletion_doc_running(company)
 
 	tdr = frappe.get_doc({"doctype": "Transaction Deletion Record", "company": company})
+	tdr.flags.ignore_permissions = 1
 	tdr.insert()
 
 	tdr.generate_to_delete_list()
