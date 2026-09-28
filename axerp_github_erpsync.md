@@ -71,10 +71,12 @@ git tag --sort=-version:refname | grep axerp | head -3
 ### 2. Run the sync
 
 ```bash
-bash scripts/sync_upstream.sh v16.26.2
+bash scripts/sync_upstream.sh v16.36.1
 ```
 
 This script handles fetching, merging, rebranding (ERPNext → AXERP), committing, tagging as `<tag>-axerp` (currently `v16.36.1-axerp`), and force-pushing to origin.
+
+`ARG ERPNEXT_VERSION` stays the upstream tag (`v16.36.1`). The AXERP image tag is `v16.36.1-axerp`. Build-check commands are in `docker/CLAUDE.md` under **Build check**. `scripts/deploy.sh` packages `origin/production`, so merge `version-16` into `production` before the build.
 
 ## Critical: erpnext_integrations Module — Do NOT Rebrand
 

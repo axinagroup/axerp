@@ -30,11 +30,12 @@ EC2 pulls via IAM role — no `docker login` needed for pulls on EC2.
 ### Image tag convention
 
 ```
-v<ERPNEXT_VERSION>-axerp.<PATCH>   e.g.  v16.36.1-axerp
+v<ERPNEXT_VERSION>-axerp   e.g.  v16.36.1-axerp
 ```
 
-- Bump `<PATCH>` for any Dockerfile or bundled app change at the same ERPNext version
-- Reset to `.1` when syncing a new upstream ERPNext version
+- `ERPNEXT_VERSION` is the upstream base tag only (`frappe/erpnext:v16.36.1`). Do not put `-axerp` on that ARG.
+- The AXERP image tag is `<ERPNEXT_VERSION>-axerp` (currently `v16.36.1-axerp`).
+- Add `.<PATCH>` only for a later Dockerfile or bundled-app change that stays on the same upstream tag.
 - **Two files must always be in sync:**
   - `docker/Dockerfile` line 10: `# -t axerp:v16.36.1-axerp -t axerp:prod .`
   - `infrastructure/docker/docker-compose.axerp.yml`: `image: 010438486646.dkr.ecr.us-east-1.amazonaws.com/axerp:v16.36.1-axerp`
@@ -80,9 +81,50 @@ grep -n "Integrations" erpnext/modules.txt   # must say ERPNext Integrations
 
 # 5. Open PR: version-16 → production, merge
 
-# 6. Deploy
+# 6. Build check, then deploy. See "Build check" below.
 bash scripts/deploy.sh
 ```
+
+## Build check
+
+Run this on `version-16` before `bash scripts/deploy.sh`. The deploy script packages **`origin/production`**, so the build uses the old image until the `version-16` → `production` PR is merged.
+
+```bash
+# 1. Release identity
+git describe --tags --exact-match HEAD    # v16.36.1-axerp
+grep '^ARG ERPNEXT_VERSION=' docker/Dockerfile
+# ARG ERPNEXT_VERSION=v16.36.1
+
+# 2. Image tag — both lines must be v16.36.1-axerp
+grep "axerp:v" docker/Dockerfile | grep -v '^#.*ARG' | head -1
+grep "image:.*axerp:" infrastructure/docker/docker-compose.axerp.yml | head -1
+
+# 3. Integrations module was not rebranded
+grep -n "Integrations" erpnext/modules.txt
+# line 15 must be: ERPNext Integrations
+grep -R '"module": "AXERP Integrations"' erpnext/erpnext_integrations --include='*.json'
+# must print nothing
+
+# 4. Base image exists (the ARG, not the AXERP tag)
+# frappe/erpnext:v16.36.1 must resolve. frappe/erpnext:v16.36.1-axerp does not exist.
+
+# 5. Merge version-16 → production, then:
+bash scripts/deploy.sh --dry-run
+bash scripts/deploy.sh
+```
+
+After the EC2 build finishes, confirm the image and the site:
+
+```bash
+aws ecr describe-images --repository-name axerp --region us-east-1 \
+  --image-ids imageTag=v16.36.1-axerp \
+  --query "imageDetails[0].imageTags" --output text
+
+curl -s "https://erp.tspgusa.com/api/method/ping"
+# {"message":"pong"}
+```
+
+Then run **Post-Deploy Health Verification** below: ping, navbar items, sitename, and logo URLs.
 
 ## How to Add a Bundled App
 
