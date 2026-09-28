@@ -23,7 +23,7 @@
 set -euo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
-EC2_INSTANCE="i-07bb8581203e52527"
+EC2_INSTANCE="i-08de3cab7640d0c62"
 AWS_REGION="us-east-1"
 AWS_ACCOUNT="010438486646"
 ECR_REGISTRY="${AWS_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com"

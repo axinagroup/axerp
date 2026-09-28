@@ -6,10 +6,10 @@ Production AXERP (ERPNext fork) running at **https://erp.tspgusa.com**.
 
 | Item | Value |
 |------|-------|
-| Host | EC2 `i-07bb8581203e52527` (t4g.xlarge, arm64 Graviton2, us-east-1f) |
+| Host | EC2 `i-08de3cab7640d0c62` (`mailsvr-tspgusa`, t4g.large, arm64 Graviton2, us-east-1f) |
 | Access | AWS SSM only — no SSH. Use `aws ssm send-command` |
 | ECR registry | `010438486646.dkr.ecr.us-east-1.amazonaws.com/axerp` |
-| EC2 IAM role | `axina-openproject-role` (has `AmazonEC2ContainerRegistryPowerUser`) |
+| EC2 IAM role | `mailsvr-s3-backup-role` via instance profile `mailsvr-s3-backup-profile`. Inline policy `AxerpEcrPull` can pull `axerp` and call `ecr:GetAuthorizationToken`. It cannot push an image. |
 | Compose on EC2 | `/opt/openproject/docker-compose.axerp.yml` |
 | Outer nginx | `/opt/openproject/nginx.conf` |
 | Inner nginx | `/data/axerp/sites/frappe_nginx.conf` (bind-mounted into axerp-frontend) |
@@ -181,7 +181,7 @@ docker exec axerp-backend bench version   # check running frappe version
 # Runs automatically via scripts/deploy.sh
 # To run manually:
 aws ssm send-command \
-  --instance-ids i-07bb8581203e52527 \
+  --instance-ids i-08de3cab7640d0c62 \
   --document-name "AWS-RunShellScript" --region us-east-1 \
   --parameters '{"commands":["aws s3 cp s3://axina-openproject-files/deploy/axerp-fix-assets-json.sh /tmp/fix.sh --quiet && SITE=erp.tspgusa.com bash /tmp/fix.sh"]}'
 ```
