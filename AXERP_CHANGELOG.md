@@ -7,7 +7,7 @@ For upstream ERPNext release notes see: https://github.com/frappe/erpnext/releas
 
 ---
 
-## [v16.36.1-axerp.1] — upstream: v16.36.1 | 2026-09-28 | Daniel Brody
+## [v16.36.1-axerp] — upstream: v16.36.1 | 2026-09-28 | Daniel Brody
 
 ### Upgraded — upstream ERPNext v16.36.1
 
@@ -25,7 +25,7 @@ Merged upstream ERPNext v16.36.1 into version-16 branch with AXERP branding appl
 
 **Dockerfile:**
 - `ERPNEXT_VERSION` bumped `v16.26.2` → `v16.36.1`
-- Build tag: `axerp:v16.36.1-axerp.1`
+- Build tag: `axerp:v16.36.1-axerp`
 
 ---
 

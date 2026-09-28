@@ -7,7 +7,7 @@
 #
 # Build:
 #   docker build --platform linux/arm64 -f docker/Dockerfile \
-#     -t axerp:v16.26.2-axerp.5 -t axerp:prod .
+#     -t axerp:v16.36.1-axerp -t axerp:prod .
 
 ARG ERPNEXT_VERSION=v16.36.1
 ARG HRMS_VERSION=version-16

@@ -30,22 +30,22 @@ EC2 pulls via IAM role — no `docker login` needed for pulls on EC2.
 ### Image tag convention
 
 ```
-v<ERPNEXT_VERSION>-axerp.<PATCH>   e.g.  v16.26.2-axerp.5
+v<ERPNEXT_VERSION>-axerp.<PATCH>   e.g.  v16.36.1-axerp
 ```
 
 - Bump `<PATCH>` for any Dockerfile or bundled app change at the same ERPNext version
 - Reset to `.1` when syncing a new upstream ERPNext version
 - **Two files must always be in sync:**
-  - `docker/Dockerfile` line 10: `# -t axerp:v16.26.2-axerp.5 -t axerp:prod .`
-  - `infrastructure/docker/docker-compose.axerp.yml`: `image: 010438486646.dkr.ecr.us-east-1.amazonaws.com/axerp:v16.26.2-axerp.5`
+  - `docker/Dockerfile` line 10: `# -t axerp:v16.36.1-axerp -t axerp:prod .`
+  - `infrastructure/docker/docker-compose.axerp.yml`: `image: 010438486646.dkr.ecr.us-east-1.amazonaws.com/axerp:v16.36.1-axerp`
 - `deploy.sh` reads the tag from the **compose file** (primary); the Dockerfile comment is fallback only
 
-## Bundled Apps (current: axerp.5 @ v16.26.2)
+## Bundled Apps (current: v16.36.1-axerp)
 
 | App | Branch/Pin | Version | Notes |
 |-----|-----------|---------|-------|
-| frappe | base image | 16.26.2 | auto-matches ERPNEXT_VERSION |
-| erpnext (AXERP) | production branch | 16.26.2 | rebranded fork |
+| frappe | base image | 16.36.1 | auto-matches ERPNEXT_VERSION |
+| erpnext (AXERP) | version-16 | 16.36.1-axerp | rebranded fork |
 | hrms | version-16 | 16.12.1 | |
 | crm | main | 1.77.3 | yarn pre-install required |
 | insights | develop | 3.3.1 | version-3 is frappe 14/15 only |

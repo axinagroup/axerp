@@ -11,7 +11,7 @@
 #   axerp-mariadb         → ERPNext only              (MariaDB 10.6)
 #
 # Image tag convention: axerp:<ERPNEXT_VERSION>-axerp.<PATCH>
-# Current: 010438486646.dkr.ecr.us-east-1.amazonaws.com/axerp:v16.26.2-axerp.5
+# Current: 010438486646.dkr.ecr.us-east-1.amazonaws.com/axerp:v16.36.1-axerp
 # Images stored in AWS ECR Private (us-east-1). EC2 pulls via IAM role (no credentials needed).
 # To upgrade upstream: bump tag, pull + rebuild on EC2, redeploy.
 #
@@ -26,7 +26,7 @@
 # After every deploy, migrate runs automatically via the migrate service.
 
 x-axerp-image: &axerp_image
-  image: 010438486646.dkr.ecr.us-east-1.amazonaws.com/axerp:v16.26.2-axerp.5
+  image: 010438486646.dkr.ecr.us-east-1.amazonaws.com/axerp:v16.36.1-axerp
   platform: linux/arm64
   restart: unless-stopped
   networks:
