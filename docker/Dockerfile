@@ -113,6 +113,9 @@ RUN cd apps/crm/frontend && yarn install --no-frozen-lockfile --silent
 # Insights frontend links @framework/ui to apps/frappe/ui. Install after the
 # telemetry/TrialBanner/island overlay so the link and postinstall patches resolve.
 RUN cd apps/insights/frontend && yarn install --no-frozen-lockfile --silent
+# Desk Dashboard and Dashboard Chart render through these islands.
+# bench build does not produce them; without this step assets.json 404s.
+RUN cd apps/insights/frontend && yarn build:islands --production
 
 # hrms Vite build imports socketio_port from sites/common_site_config.json
 # at build time. This file doesn't exist during docker build (it's created
