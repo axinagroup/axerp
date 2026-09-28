@@ -91,7 +91,7 @@ Run this on `version-16` before `bash scripts/deploy.sh`. The deploy script pack
 
 ```bash
 # 1. Release identity
-git describe --tags --exact-match HEAD    # v16.36.1-axerp
+git describe --tags --abbrev=0           # v16.36.1-axerp
 grep '^ARG ERPNEXT_VERSION=' docker/Dockerfile
 # ARG ERPNEXT_VERSION=v16.36.1
 
