@@ -179,7 +179,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
 CURRENT_BRANCH=$(git branch --show-current)
-[[ "$CURRENT_BRANCH" != "production" ]] && warn "On branch ${CURRENT_BRANCH} — packaging origin/production"
+[[ "$CURRENT_BRANCH" != "production" ]] && warn "On branch ${CURRENT_BRANCH} — packaging origin/${CURRENT_BRANCH}"
 
 # Detect image tag from the compose file (source of truth for what gets deployed),
 # falling back to the Dockerfile build comment. Reading the compose file avoids
@@ -204,13 +204,13 @@ log "EC2:        ${EC2_INSTANCE}"
 $DRY_RUN && warn "DRY RUN — no changes"
 echo ""
 
-# ── Step 1: Package production branch ────────────────────────────────────────
-log "Step 1/7 — Package production branch → S3"
+# ── Step 1: Package the branch being deployed ────────────────────────────────
+log "Step 1/7 — Package origin/${CURRENT_BRANCH} → S3"
 
 # Always fetch first — without this, git archive uses a stale cached local ref
 # (the known production failure: tarball packaged the pre-merge Dockerfile)
-run git fetch origin production
-run git archive origin/production \
+run git fetch origin "${CURRENT_BRANCH}"
+run git archive "origin/${CURRENT_BRANCH}" \
   --format=tar.gz -o /tmp/axerp-production.tar.gz --prefix=axerp/
 
 log "  Tarball: $(du -sh /tmp/axerp-production.tar.gz 2>/dev/null | cut -f1)"
@@ -389,11 +389,15 @@ if $SKIP_BUILD; then
   warn "Step 3/7 — Skipped (--skip-build)"
 else
   ssm_run "Step 3a/7 — Stage scripts on EC2 (kill stale builds first)" \
-    "pkill -f axerp-deploy-run.sh 2>/dev/null; echo 'Killed stale builds (if any)'" \
-    "aws s3 cp s3://${S3_BUCKET}/${S3_PREFIX}/axerp-deploy-run.sh /tmp/axerp-deploy-run.sh --quiet" \
-    "aws s3 cp s3://${S3_BUCKET}/${S3_PREFIX}/axerp-launch.sh /tmp/axerp-launch.sh --quiet" \
-    "chmod +x /tmp/axerp-deploy-run.sh /tmp/axerp-launch.sh" \
-    "rm -f /tmp/axerp-deploy-status /tmp/axerp-deploy-run.log"
+    "bash -lc 'set -eu
+pkill -f axerp-deploy-run.sh >/dev/null 2>&1 || true
+echo \"Killed stale builds (if any)\"
+aws s3 cp s3://${S3_BUCKET}/${S3_PREFIX}/axerp-deploy-run.sh /tmp/axerp-deploy-run.sh
+aws s3 cp s3://${S3_BUCKET}/${S3_PREFIX}/axerp-launch.sh /tmp/axerp-launch.sh
+chmod +x /tmp/axerp-deploy-run.sh /tmp/axerp-launch.sh
+test -s /tmp/axerp-launch.sh
+rm -f /tmp/axerp-deploy-status /tmp/axerp-deploy-run.log
+echo STAGED'"
 
   ssm_run "Step 3b/7 — Launch background build" \
     "bash /tmp/axerp-launch.sh" \

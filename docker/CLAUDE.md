@@ -9,7 +9,7 @@ Production AXERP (ERPNext fork) running at **https://erp.tspgusa.com**.
 | Host | EC2 `i-08de3cab7640d0c62` (`mailsvr-tspgusa`, t4g.large, arm64 Graviton2, us-east-1f) |
 | Access | AWS SSM only — no SSH. Use `aws ssm send-command` |
 | ECR registry | `010438486646.dkr.ecr.us-east-1.amazonaws.com/axerp` |
-| EC2 IAM role | `mailsvr-s3-backup-role` via instance profile `mailsvr-s3-backup-profile`. Inline policy `AxerpEcrPull` can pull `axerp` and call `ecr:GetAuthorizationToken`. It cannot push an image. |
+| EC2 IAM role | `mailsvr-s3-backup-role` via `mailsvr-s3-backup-profile`. `AxerpEcrPull` pulls and logs in. `AxerpDeploy` reads `s3://axina-openproject-files/deploy/*` and pushes the `axerp` repository. |
 | Compose on EC2 | `/opt/openproject/docker-compose.axerp.yml` |
 | Outer nginx | `/opt/openproject/nginx.conf` |
 | Inner nginx | `/data/axerp/sites/frappe_nginx.conf` (bind-mounted into axerp-frontend) |
