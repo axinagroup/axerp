@@ -23,6 +23,85 @@ def _table_exists(table):
     return bool(frappe.db.sql("SHOW TABLES LIKE %s", table))
 
 
+def _share_workbook(name):
+    exists = frappe.db.exists(
+        "DocShare",
+        {"share_doctype": "Insights Workbook", "share_name": name, "everyone": 1},
+    )
+    if exists:
+        return
+    frappe.share.add(
+        "Insights Workbook",
+        name,
+        read=1,
+        write=0,
+        share=0,
+        everyone=1,
+        notify=0,
+    )
+
+
+def _dimension(column_name):
+    return {"column_name": column_name, "dimension_name": column_name, "data_type": "String"}
+
+
+def _measure(column_name):
+    return {
+        "column_name": column_name,
+        "measure_name": column_name,
+        "data_type": "Integer",
+        "aggregation": "sum",
+    }
+
+
+def _chart(workbook, title, query, rows, value, sort_order):
+    existing = frappe.db.get_value(
+        "Insights Chart v3", {"workbook": workbook, "title": title}, "name"
+    )
+    doc = frappe.get_doc("Insights Chart v3", existing) if existing else frappe.new_doc("Insights Chart v3")
+    doc.title = title
+    doc.workbook = workbook
+    doc.query = query
+    doc.chart_type = "Table"
+    doc.is_standard = 0
+    doc.visibility = "Everyone"
+    doc.sort_order = sort_order
+    doc.config = json.dumps(
+        {
+            "rows": [_dimension(column) for column in rows],
+            "columns": [],
+            "values": [_measure(value)],
+        }
+    )
+    doc.save(ignore_permissions=True)
+    return doc.name
+
+
+def _dashboard(workbook, title, charts):
+    existing = frappe.db.get_value(
+        "Insights Dashboard v3", {"workbook": workbook, "title": title}, "name"
+    )
+    doc = (
+        frappe.get_doc("Insights Dashboard v3", existing)
+        if existing
+        else frappe.new_doc("Insights Dashboard v3")
+    )
+    doc.title = title
+    doc.workbook = workbook
+    doc.is_standard = 0
+    doc.visibility = "Everyone"
+    doc.items = [
+        {
+            "type": "chart",
+            "chart": chart,
+            "layout": {"i": frappe.generate_hash(length=8), "x": 0, "y": index * 14, "w": 20, "h": 12},
+        }
+        for index, chart in enumerate(charts)
+    ]
+    doc.save(ignore_permissions=True)
+    return doc.name
+
+
 def _native_query(workbook, title, source, sql, sort_order):
     existing = frappe.db.get_value(
         "Insights Query v3", {"workbook": workbook, "title": title}, "name"
@@ -64,47 +143,44 @@ def run():
         frappe.reload_doc("insights", "doctype", dt, force=True)
     frappe.db.commit()
     source = _site_source()
-    created = {"source": source, "workbooks": {}}
+    created = {"source": source, "workbooks": {}, "dashboards": {}}
 
-    user_wb = _workbook("User stats")
-    queries = []
-    queries.append(
-        _native_query(
-            user_wb,
-            "Users by type",
-            source,
-            """
-            SELECT user_type, IF(enabled = 1, 'Enabled', 'Disabled') AS status, COUNT(*) AS users
-            FROM tabUser
-            WHERE name NOT IN ('Guest', 'Administrator')
-            GROUP BY user_type, enabled
-            ORDER BY users DESC
-            """,
-            0,
-        )
-    )
-    queries.append(
-        _native_query(
-            user_wb,
-            "New users by day",
-            source,
-            """
-            SELECT DATE(creation) AS day, COUNT(*) AS new_users
-            FROM tabUser
-            WHERE name NOT IN ('Guest', 'Administrator')
-              AND creation >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
-            GROUP BY DATE(creation)
-            ORDER BY day
-            """,
-            1,
-        )
-    )
+    specs = {
+        "User stats": [
+            (
+                "Users by type",
+                ["user_type", "status"],
+                "users",
+                """
+                SELECT user_type, IF(enabled = 1, 'Enabled', 'Disabled') AS status, COUNT(*) AS users
+                FROM tabUser
+                WHERE name NOT IN ('Guest', 'Administrator')
+                GROUP BY user_type, enabled
+                ORDER BY users DESC
+                """,
+            ),
+            (
+                "New users by day",
+                ["day"],
+                "new_users",
+                """
+                SELECT DATE(creation) AS day, COUNT(*) AS new_users
+                FROM tabUser
+                WHERE name NOT IN ('Guest', 'Administrator')
+                  AND creation >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+                GROUP BY DATE(creation)
+                ORDER BY day
+                """,
+            ),
+        ],
+        "Website stats": [],
+    }
     if _table_exists("tabActivity Log"):
-        queries.append(
-            _native_query(
-                user_wb,
+        specs["User stats"].append(
+            (
                 "Logins by day",
-                source,
+                ["day"],
+                "logins",
                 """
                 SELECT DATE(creation) AS day, COUNT(*) AS logins
                 FROM `tabActivity Log`
@@ -113,51 +189,44 @@ def run():
                 GROUP BY DATE(creation)
                 ORDER BY day
                 """,
-                2,
             )
         )
-    created["workbooks"]["User stats"] = queries
-
-    web_wb = _workbook("Website stats")
-    web_queries = []
     if _table_exists("tabWeb Page View"):
-        web_queries.append(
-            _native_query(
-                web_wb,
-                "Page views by path",
-                source,
-                """
-                SELECT path, COUNT(*) AS views
-                FROM `tabWeb Page View`
-                WHERE creation >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
-                GROUP BY path
-                ORDER BY views DESC
-                LIMIT 50
-                """,
-                0,
-            )
-        )
-        web_queries.append(
-            _native_query(
-                web_wb,
-                "Page views by day",
-                source,
-                """
-                SELECT DATE(creation) AS day, COUNT(*) AS views
-                FROM `tabWeb Page View`
-                WHERE creation >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
-                GROUP BY DATE(creation)
-                ORDER BY day
-                """,
-                1,
-            )
+        specs["Website stats"].extend(
+            [
+                (
+                    "Page views by path",
+                    ["path"],
+                    "views",
+                    """
+                    SELECT path, COUNT(*) AS views
+                    FROM `tabWeb Page View`
+                    WHERE creation >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+                    GROUP BY path
+                    ORDER BY views DESC
+                    LIMIT 50
+                    """,
+                ),
+                (
+                    "Page views by day",
+                    ["day"],
+                    "views",
+                    """
+                    SELECT DATE(creation) AS day, COUNT(*) AS views
+                    FROM `tabWeb Page View`
+                    WHERE creation >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+                    GROUP BY DATE(creation)
+                    ORDER BY day
+                    """,
+                ),
+            ]
         )
     elif _table_exists("tabView Log"):
-        web_queries.append(
-            _native_query(
-                web_wb,
+        specs["Website stats"].append(
+            (
                 "Document views by type",
-                source,
+                ["reference_doctype"],
+                "views",
                 """
                 SELECT reference_doctype, COUNT(*) AS views
                 FROM `tabView Log`
@@ -165,15 +234,14 @@ def run():
                 GROUP BY reference_doctype
                 ORDER BY views DESC
                 """,
-                0,
             )
         )
     if _table_exists("tabBlog Post"):
-        web_queries.append(
-            _native_query(
-                web_wb,
+        specs["Website stats"].append(
+            (
                 "Published blog posts",
-                source,
+                ["day"],
+                "posts",
                 """
                 SELECT DATE(published_on) AS day, COUNT(*) AS posts
                 FROM `tabBlog Post`
@@ -182,26 +250,36 @@ def run():
                 ORDER BY day DESC
                 LIMIT 30
                 """,
-                2,
             )
         )
     if _table_exists("tabWeb Page"):
-        web_queries.append(
-            _native_query(
-                web_wb,
+        specs["Website stats"].append(
+            (
                 "Web pages",
-                source,
+                ["published"],
+                "pages",
                 """
                 SELECT published, COUNT(*) AS pages
                 FROM `tabWeb Page`
                 GROUP BY published
                 """,
-                3,
             )
         )
-    if not web_queries:
+    if not specs["Website stats"]:
         frappe.throw("No website tables found for Insights")
-    created["workbooks"]["Website stats"] = web_queries
+
+    for title, items in specs.items():
+        workbook = _workbook(title)
+        _share_workbook(workbook)
+        charts = []
+        queries = []
+        for index, (query_title, rows, value, sql) in enumerate(items):
+            query = _native_query(workbook, query_title, source, sql, index)
+            queries.append(query)
+            charts.append(_chart(workbook, query_title, query, rows, value, index))
+        dashboard = _dashboard(workbook, title, charts)
+        created["workbooks"][title] = queries
+        created["dashboards"][title] = dashboard
     frappe.db.commit()
     print(json.dumps(created))
     return created
