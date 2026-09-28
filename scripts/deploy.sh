@@ -390,7 +390,9 @@ if $SKIP_BUILD; then
 else
   ssm_run "Step 3a/7 — Stage scripts on EC2 (kill stale builds first)" \
     "bash -lc 'set -eu
-pkill -f axerp-deploy-run.sh >/dev/null 2>&1 || true
+# Bracket so this command line does not match itself. A plain pattern
+# SIGTERMs the SSM shell (exit 143) because the shell argv contains the name.
+pkill -f '[a]xerp-deploy-run.sh' >/dev/null 2>&1 || true
 echo \"Killed stale builds (if any)\"
 aws s3 cp s3://${S3_BUCKET}/${S3_PREFIX}/axerp-deploy-run.sh /tmp/axerp-deploy-run.sh
 aws s3 cp s3://${S3_BUCKET}/${S3_PREFIX}/axerp-launch.sh /tmp/axerp-launch.sh
@@ -402,7 +404,7 @@ echo STAGED'"
   ssm_run "Step 3b/7 — Launch background build" \
     "bash /tmp/axerp-launch.sh" \
     "sleep 5" \
-    "if pgrep -f axerp-deploy-run.sh > /dev/null; then echo BUILD_RUNNING; else echo LAUNCH_FAILED && exit 1; fi"
+    "if pgrep -f '[a]xerp-deploy-run.sh' > /dev/null; then echo BUILD_RUNNING; else echo LAUNCH_FAILED && exit 1; fi"
 
   if ! $DRY_RUN; then
     poll_background_build
