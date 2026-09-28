@@ -12,8 +12,9 @@
 ARG ERPNEXT_VERSION=v16.36.1
 ARG HRMS_VERSION=version-16
 ARG CRM_VERSION=main
-# insights version-3 is frappe 14/15 only; develop branch has explicit v16 CI
-ARG INSIGHTS_VERSION=develop
+# Last develop commit before insights imported @framework/ui/telemetry.
+# That module is on frappe develop only, not in the v16.36.1 base image.
+ARG INSIGHTS_VERSION=6bb39c91e042b970e123cfa409f39b0792ae1e78
 ARG WIKI_VERSION=version-3
 ARG BLOG_VERSION=develop
 
@@ -41,11 +42,12 @@ RUN git clone --depth 1 --branch ${CRM_VERSION} \
       /home/frappe/frappe-bench/apps/crm \
     && chown -R frappe:frappe /home/frappe/frappe-bench/apps/crm
 
-# ── Insights (develop = v16-compatible) ───────────────────────────────────
-RUN git clone --depth 1 --branch ${INSIGHTS_VERSION} \
-      https://github.com/frappe/insights.git \
-      /home/frappe/frappe-bench/apps/insights \
-    && chown -R frappe:frappe /home/frappe/frappe-bench/apps/insights
+# ── Insights (pinned commit; --branch cannot check out a raw SHA) ────────
+RUN git init /home/frappe/frappe-bench/apps/insights \
+ && git -C /home/frappe/frappe-bench/apps/insights remote add origin https://github.com/frappe/insights.git \
+ && git -C /home/frappe/frappe-bench/apps/insights fetch --depth 1 origin ${INSIGHTS_VERSION} \
+ && git -C /home/frappe/frappe-bench/apps/insights checkout --detach FETCH_HEAD \
+ && chown -R frappe:frappe /home/frappe/frappe-bench/apps/insights
 
 # ── Wiki ──────────────────────────────────────────────────────────────────
 RUN git clone --depth 1 --branch ${WIKI_VERSION} \
