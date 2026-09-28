@@ -65,20 +65,7 @@ RUN git clone --depth 1 --filter=blob:none --sparse --branch develop \
  && cp -a /tmp/frappe-ui/ui/island "${UI}/island" \
  && cp -a /tmp/frappe-ui/ui/vite/island "${UI}/vite/island" \
  && if [ -d /tmp/frappe-ui/ui/patches ]; then cp -a /tmp/frappe-ui/ui/patches "${UI}/patches"; fi \
- && python3 - <<'PY'
-import json
-path = "/home/frappe/frappe-bench/apps/frappe/ui/package.json"
-with open(path) as f:
-    pkg = json.load(f)
-exports = pkg.setdefault("exports", {})
-exports.setdefault("./island", {"import": "./island/index.js"})
-exports.setdefault("./island/host", {"import": "./island/host.js"})
-exports["./island/Island.vue"] = "./island/Island.vue"
-exports.setdefault("./vite/island", {"import": "./vite/island/index.js"})
-with open(path, "w") as f:
-    json.dump(pkg, f, indent=2)
-    f.write("\n")
-PY
+ && python3 -c 'import json; p="/home/frappe/frappe-bench/apps/frappe/ui/package.json"; pkg=json.load(open(p)); e=pkg.setdefault("exports", {}); e.setdefault("./island", {"import": "./island/index.js"}); e.setdefault("./island/host", {"import": "./island/host.js"}); e["./island/Island.vue"]="./island/Island.vue"; e.setdefault("./vite/island", {"import": "./vite/island/index.js"}); f=open(p,"w"); json.dump(pkg, f, indent=2); f.write("\n"); f.close()' \
  && rm -rf /tmp/frappe-ui \
  && chown -R frappe:frappe /home/frappe/frappe-bench/apps/frappe/ui
 
