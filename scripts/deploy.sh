@@ -331,10 +331,10 @@ DB_PASS=\$(docker exec axerp-backend python3 -c \
   "import json; c=json.load(open('/home/frappe/frappe-bench/sites/\${SITE}/site_config.json')); print(c['db_password'])" 2>/dev/null)
 if [ -n "\$DB_NAME" ]; then
   DEMO_COUNT=\$(docker exec axerp-mariadb mysql -u "\$DB_NAME" -p"\$DB_PASS" "\$DB_NAME" \
-    -sN -e "SELECT COUNT(*) FROM \`tabNavbar Item\` WHERE parentfield='settings_dropdown' AND item_label='Delete Demo Data';" 2>/dev/null || echo "0")
+    -sN -e 'SELECT COUNT(*) FROM \`tabNavbar Item\` WHERE parentfield='\''settings_dropdown'\'' AND item_label='\''Delete Demo Data'\'';' 2>/dev/null || echo "0")
   if [ "\$DEMO_COUNT" != "0" ] && [ "\$DEMO_COUNT" != "" ]; then
     docker exec axerp-mariadb mysql -u "\$DB_NAME" -p"\$DB_PASS" "\$DB_NAME" \
-      -e "DELETE FROM \`tabNavbar Item\` WHERE parentfield='settings_dropdown' AND item_label='Delete Demo Data';" 2>/dev/null
+      -e 'DELETE FROM \`tabNavbar Item\` WHERE parentfield='\''settings_dropdown'\'' AND item_label='\''Delete Demo Data'\'';' 2>/dev/null
     echo "  Removed 'Delete Demo Data' navbar item (was causing GET /undefined 404)"
   else
     echo "  Navbar items: OK (no icon-less demo items found)"
@@ -368,13 +368,10 @@ EOBUILD
 cat > /tmp/axerp-launch.sh << 'EOLAUNCH'
 #!/bin/bash
 rm -f /tmp/axerp-deploy-status /tmp/axerp-deploy-run.log
-(
-  bash /tmp/axerp-deploy-run.sh > /tmp/axerp-deploy-run.log 2>&1
-  echo $? > /tmp/axerp-deploy-status
-) &
-BGPID=$!
-echo "Launched build PID $BGPID"
-disown $BGPID
+# New session so SSM does not wait on the build and hit its 10 minute cap.
+setsid nohup bash /tmp/axerp-deploy-run.sh > /tmp/axerp-deploy-run.log 2>&1 < /dev/null &
+echo $! > /tmp/axerp-deploy.pid
+echo "Launched build PID $(cat /tmp/axerp-deploy.pid)"
 EOLAUNCH
 
 if ! $DRY_RUN; then
