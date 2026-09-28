@@ -388,18 +388,17 @@ echo ""
 if $SKIP_BUILD; then
   warn "Step 3/7 — Skipped (--skip-build)"
 else
+  # Keep pkill in its own command. Wrapping it in bash -lc together with the
+  # s3 paths puts axerp-deploy-run.sh in that bash argv, and pkill SIGTERMs
+  # itself (SSM exit 143, "Terminated").
   ssm_run "Step 3a/7 — Stage scripts on EC2 (kill stale builds first)" \
-    "bash -lc 'set -eu
-# Bracket so this command line does not match itself. A plain pattern
-# SIGTERMs the SSM shell (exit 143) because the shell argv contains the name.
-pkill -f '[a]xerp-deploy-run.sh' >/dev/null 2>&1 || true
-echo \"Killed stale builds (if any)\"
-aws s3 cp s3://${S3_BUCKET}/${S3_PREFIX}/axerp-deploy-run.sh /tmp/axerp-deploy-run.sh
-aws s3 cp s3://${S3_BUCKET}/${S3_PREFIX}/axerp-launch.sh /tmp/axerp-launch.sh
-chmod +x /tmp/axerp-deploy-run.sh /tmp/axerp-launch.sh
-test -s /tmp/axerp-launch.sh
-rm -f /tmp/axerp-deploy-status /tmp/axerp-deploy-run.log
-echo STAGED'"
+    "pkill -f '[a]xerp-deploy-run.sh' >/dev/null 2>&1 || true" \
+    "echo Killed stale builds" \
+    "aws s3 cp s3://${S3_BUCKET}/${S3_PREFIX}/axerp-deploy-run.sh /tmp/axerp-deploy-run.sh" \
+    "aws s3 cp s3://${S3_BUCKET}/${S3_PREFIX}/axerp-launch.sh /tmp/axerp-launch.sh" \
+    "chmod +x /tmp/axerp-deploy-run.sh /tmp/axerp-launch.sh" \
+    "rm -f /tmp/axerp-deploy-status /tmp/axerp-deploy-run.log" \
+    "test -s /tmp/axerp-launch.sh && echo STAGED"
 
   ssm_run "Step 3b/7 — Launch background build" \
     "bash /tmp/axerp-launch.sh" \
