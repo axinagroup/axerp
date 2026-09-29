@@ -13,6 +13,7 @@ from erpnext.stock.doctype.pick_list.pick_list import (
 	create_delivery,
 	create_delivery_note,
 	create_dn_for_pick_lists,
+	create_stock_entry,
 )
 from erpnext.stock.doctype.purchase_receipt.test_purchase_receipt import make_purchase_receipt
 from erpnext.stock.doctype.serial_and_batch_bundle.test_serial_and_batch_bundle import (
@@ -1220,6 +1221,155 @@ class TestPickList(AXERPTestSuite):
 		pl.cancel()
 		pl.reload()
 		self.assertEqual(pl.status, "Cancelled")
+
+	def test_pick_list_partial_transfer_status(self):
+		"""Partial Stock Entries from a Pick List should track transferred_qty and drive the
+		Partially Transferred / Completed status, and allow further transfers for the remainder."""
+		from erpnext.stock.doctype.warehouse.test_warehouse import create_warehouse
+
+		item = make_item(properties={"is_stock_item": 1}).name
+		source_warehouse = "_Test Warehouse - _TC"
+		target_warehouse = create_warehouse("_Test Transfer Target Warehouse")
+		make_stock_entry(item=item, to_warehouse=source_warehouse, qty=10)
+
+		pick_list = frappe.get_doc(
+			{
+				"doctype": "Pick List",
+				"company": "_Test Company",
+				"purpose": "Material Transfer",
+				"pick_manually": 1,
+				"locations": [
+					{
+						"item_code": item,
+						"qty": 10,
+						"stock_qty": 10,
+						"conversion_factor": 1,
+						"warehouse": source_warehouse,
+						"picked_qty": 10,
+					}
+				],
+			}
+		)
+		pick_list.submit()
+		self.assertEqual(pick_list.status, "Open")
+
+		# Transfer 4 of the 10 picked units.
+		se1 = frappe.get_doc(create_stock_entry(pick_list.as_dict()))
+		self.assertEqual(se1.items[0].qty, 10)
+		se1.items[0].qty = 4
+		se1.items[0].t_warehouse = target_warehouse
+		se1.submit()
+
+		pick_list.reload()
+		self.assertEqual(pick_list.locations[0].transferred_qty, 4)
+		self.assertEqual(pick_list.status, "Partially Transferred")
+
+		# The next Stock Entry should only offer the remaining 6 units.
+		se2 = frappe.get_doc(create_stock_entry(pick_list.as_dict()))
+		self.assertEqual(se2.items[0].qty, 6)
+		se2.items[0].t_warehouse = target_warehouse
+		se2.submit()
+
+		pick_list.reload()
+		self.assertEqual(pick_list.locations[0].transferred_qty, 10)
+		self.assertEqual(pick_list.status, "Completed")
+
+		# Cancelling the last entry rolls transferred_qty and status back.
+		se2.cancel()
+		pick_list.reload()
+		self.assertEqual(pick_list.locations[0].transferred_qty, 4)
+		self.assertEqual(pick_list.status, "Partially Transferred")
+
+	def test_get_items_keeps_pick_list_rows_on_stock_entry(self):
+		"""Entering fg_completed_qty on a Stock Entry mapped from a Pick List triggers get_items();
+		it must not refetch from the BOM, or the pick_list_item links transferred_qty rides on are
+		lost and the Pick List stays Open with every row offered again."""
+		from erpnext.manufacturing.doctype.production_plan.test_production_plan import make_bom
+		from erpnext.manufacturing.doctype.work_order.work_order import (
+			create_pick_list as pick_list_for_wo,
+		)
+		from erpnext.manufacturing.doctype.work_order.work_order import make_work_order
+		from erpnext.stock.doctype.warehouse.test_warehouse import create_warehouse
+
+		source_warehouse = create_warehouse("_Test Partial Transfer Source")
+		wip_warehouse = create_warehouse("_Test Partial Transfer WIP", company="_Test Company")
+		fg_warehouse = create_warehouse("_Test Partial Transfer FG", company="_Test Company")
+		fg_item = make_item(properties={"is_stock_item": 1}).name
+		rm_item = make_item(properties={"is_stock_item": 1}).name
+		bom = make_bom(item=fg_item, rate=100, raw_materials=[rm_item])
+		make_stock_entry(item=rm_item, to_warehouse=source_warehouse, qty=100)
+
+		wo = make_work_order(item=fg_item, qty=10, bom_no=bom.name, company="_Test Company")
+		wo.required_items[0].source_warehouse = source_warehouse
+		wo.wip_warehouse = wip_warehouse
+		wo.fg_warehouse = fg_warehouse
+		wo.submit()
+
+		pick_list = pick_list_for_wo(wo.name, for_qty=wo.qty)
+		pick_list.save().submit()
+		self.assertEqual(pick_list.status, "Open")
+
+		se = frappe.get_doc(create_stock_entry(pick_list.as_dict()))
+		self.assertTrue(all(row.pick_list_item for row in se.items))
+		self.assertEqual(se.fg_completed_qty, 0)
+
+		se.fg_completed_qty = 4
+		se.get_items()
+		self.assertEqual(len(se.items), len(pick_list.locations))
+		self.assertTrue(all(row.pick_list_item for row in se.items))
+		se.fg_completed_qty = 0
+
+		for row in se.items:
+			row.qty = 4
+		se.save().submit()
+		self.assertEqual(se.fg_completed_qty, 0)
+
+		pick_list.reload()
+		self.assertEqual(pick_list.locations[0].transferred_qty, 4)
+		self.assertEqual(pick_list.status, "Partially Transferred")
+
+		next_se = frappe.get_doc(create_stock_entry(pick_list.as_dict()))
+		self.assertEqual(len(next_se.items), 1)
+		self.assertEqual(next_se.items[0].qty, 6)
+
+	def test_create_second_delivery_note_with_fully_delivered_location(self):
+		# When one pick list item is fully delivered by the first Delivery Note
+		# and another item is still pending, creating a second Delivery Note from
+		# the Pick List must not create a zero-qty row for the delivered item.
+		warehouse = "_Test Warehouse - _TC"
+		item_a = make_item(properties={"is_stock_item": 1}).name
+		item_b = make_item(properties={"is_stock_item": 1}).name
+		make_stock_entry(item=item_a, to_warehouse=warehouse, qty=20)
+		make_stock_entry(item=item_b, to_warehouse=warehouse, qty=20)
+
+		so = make_sales_order(
+			item_list=[
+				{"item_code": item_a, "warehouse": warehouse, "qty": 10, "rate": 100},
+				{"item_code": item_b, "warehouse": warehouse, "qty": 5, "rate": 100},
+			]
+		)
+
+		pl = create_pick_list(so.name)
+		pl.save().submit()
+
+		# First Delivery Note: fully deliver item_a, drop item_b.
+		dn1 = create_delivery_note(pl.name)
+		for row in list(dn1.items):
+			if row.item_code == item_b:
+				dn1.remove(row)
+		dn1.save().submit()
+
+		pl.reload()
+		delivered = {loc.item_code: loc.delivered_qty for loc in pl.locations}
+		self.assertEqual(delivered[item_a], 10)
+		self.assertEqual(delivered[item_b], 0)
+
+		# Second Delivery Note for the remaining item must succeed and must not
+		# include a zero-qty row for the already delivered item_a.
+		dn2 = create_delivery_note(pl.name)
+		self.assertEqual(len(dn2.items), 1)
+		self.assertEqual(dn2.items[0].item_code, item_b)
+		self.assertEqual(dn2.items[0].qty, 5)
 
 	def test_pick_list_validation(self):
 		warehouse = "_Test Warehouse - _TC"

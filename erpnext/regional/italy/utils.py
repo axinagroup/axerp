@@ -34,7 +34,8 @@ def update_itemised_tax_data(doc):
 def export_invoices(filters=None):
 	frappe.has_permission("Sales Invoice", throw=True)
 
-	invoices = frappe.get_all(
+	# get_list, not get_all: what leaves here is a zip of e-invoice attachments, so the rows must be scoped too
+	invoices = frappe.get_list(
 		"Sales Invoice", filters=get_conditions(filters), fields=["name", "company_tax_id"]
 	)
 
@@ -219,7 +220,7 @@ def append_row_as_charges(items, tax, reference_row, summary_data):
 # Preflight for successful e-invoice export.
 def sales_invoice_validate(doc):
 	# Validate company
-	if doc.doctype != "Sales Invoice":
+	if doc.doctype != "Sales Invoice" or doc.is_opening == "Yes":
 		return
 
 	if not doc.company_address:
@@ -303,7 +304,7 @@ def sales_invoice_validate(doc):
 # Ensure payment details are valid for e-invoice.
 def sales_invoice_on_submit(doc, method):
 	# Validate payment details
-	if get_company_country(doc.company) not in [
+	if doc.is_opening == "Yes" or get_company_country(doc.company) not in [
 		"Italy",
 		"Italia",
 		"Italian Republic",
@@ -369,7 +370,7 @@ def generate_single_invoice(docname):
 
 # Delete e-invoice attachment on cancel.
 def sales_invoice_on_cancel(doc, method):
-	if get_company_country(doc.company) not in [
+	if doc.is_opening == "Yes" or get_company_country(doc.company) not in [
 		"Italy",
 		"Italia",
 		"Italian Republic",

@@ -71,7 +71,7 @@ frappe.ui.form.on("Journal Entry", {
 
 	refresh: function (frm) {
 		if (frm.doc.reversal_of && (frm.is_new() || frm.doc.docstatus == 0)) {
-			frm.set_read_only();
+			erpnext.journal_entry.lock_reversal_entry(frm);
 		}
 
 		erpnext.toggle_naming_series();
@@ -95,7 +95,7 @@ frappe.ui.form.on("Journal Entry", {
 			);
 		}
 
-		if (frm.doc.docstatus == 1) {
+		if (frm.doc.docstatus == 1 && !frm.doc.reversal_of) {
 			frm.add_custom_button(
 				__("Reverse Journal Entry"),
 				function () {
@@ -472,8 +472,8 @@ cur_frm.cscript.update_totals = function (doc) {
 		tc += flt(accounts[i].credit, precision("credit", accounts[i]));
 	}
 	doc = locals[doc.doctype][doc.name];
-	doc.total_debit = td;
-	doc.total_credit = tc;
+	doc.total_debit = flt(td, precision("total_debit"));
+	doc.total_credit = flt(tc, precision("total_credit"));
 	doc.difference = flt(td - tc, precision("difference"));
 	refresh_many(["total_debit", "total_credit", "difference"]);
 };
@@ -564,6 +564,14 @@ $.extend(erpnext.journal_entry, {
 		});
 	},
 
+	lock_reversal_entry: function (frm) {
+		frm.fields
+			.filter((field) => field.has_input)
+			.filter((field) => !["posting_date", "custom_remark", "remark"].includes(field.df.fieldname))
+			.forEach((field) => frm.set_df_property(field.df.fieldname, "read_only", 1));
+		frm.set_df_property("accounts", "read_only", 1);
+	},
+
 	set_debit_credit_in_company_currency: function (frm, cdt, cdn) {
 		var row = locals[cdt][cdn];
 
@@ -615,7 +623,7 @@ $.extend(erpnext.journal_entry, {
 		} else {
 			erpnext.journal_entry.set_debit_credit_in_company_currency(frm, cdt, cdn);
 		}
-		refresh_field("exchange_rate", cdn, "accounts");
+		frm.get_field("accounts").grid.refresh_row(cdn);
 	},
 
 	quick_entry: function (frm) {

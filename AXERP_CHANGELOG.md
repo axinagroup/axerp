@@ -7,6 +7,28 @@ For upstream ERPNext release notes see: https://github.com/frappe/erpnext/releas
 
 ---
 
+## [v16.36.1-axerp] — upstream: v16.36.1 | 2026-09-28 | Daniel Brody
+
+### Upgraded — upstream ERPNext v16.36.1
+
+Merged upstream ERPNext v16.36.1 into version-16 branch with AXERP branding applied.
+
+**Merge conflict resolutions:**
+- `.github/workflows/patch.yml`, `review-translation-changes.yaml`, `run-individual-tests.yml`, `server-tests-mariadb.yml`, `server-tests-mariadb-faux.yml` — upstream modified these workflows; kept them deleted. Also removed the new `crowdin-actions-update-main-pot.yml`. AXERP does not run the inherited ERPNext CI.
+- 36 test modules — changes on this fork since v16.26.2 were brand-only. Accepted upstream test logic, then reapplied AXERP branding.
+
+**Rebrand:**
+- `modules.txt` still reads `ERPNext Integrations`.
+- `plaid_settings.json` `"module"` is still `ERPNext Integrations`.
+- `patches.txt` deletes Workspace `ERPNext Integrations Settings` (upstream document name).
+- `smart_rename.py` now keeps the phrase `ERPNext Integrations` in every file type. `source_link` is `https://github.com/axinagroup/axerp`.
+
+**Dockerfile:**
+- `ERPNEXT_VERSION` bumped `v16.26.2` → `v16.36.1`
+- Build tag: `axerp:v16.36.1-axerp`
+
+---
+
 ## [v16.26.2-axerp.1] — upstream: v16.26.2 | 2026-07-09 | Daniel Brody
 
 ### Upgraded — upstream ERPNext v16.26.2
@@ -47,9 +69,9 @@ Dockerfile sections: clone, pip install, bench build, and BAKED_PATH copy loop.
 
 ## [v16.25.0-axerp.1] — upstream: v16.25.0 | 2026-06-30 | Daniel Brody
 
-### Upgraded — upstream AXERP v16.25.0
+### Upgraded — upstream ERPNext v16.25.0
 
-Merged upstream AXERP v16.25.0 into version-16 branch with AXERP branding applied.
+Merged upstream ERPNext v16.25.0 into version-16 branch with AXERP branding applied.
 
 **Merge conflict resolutions (all in test files — upstream logic accepted):**
 - `test_opening_invoice_creation_tool.py` — upstream refactored `make_invoices` signature (invoices/project/cost_center params), updated expected outstanding_amount values
@@ -283,7 +305,7 @@ Companies re-created via API provisioner (`infrastructure/axerp-api/create_compa
 
 ### Changed (AXERP Rebrand)
 - Applied `scripts/smart_rename.py`: ERPNext → AXERP in UI strings, titles, metadata.
-- **Preserved** (not rebranded): `erpnext_integrations` module name, all `erpnext.erpnext_integrations.*` import paths, `"module": "AXERP Integrations"` in DocType JSON.
+- **Preserved** (not rebranded): `erpnext_integrations` module name, all `erpnext.erpnext_integrations.*` import paths, `"module": "ERPNext Integrations"` in DocType JSON.
 - **hooks.py**: `app_publisher`, `app_description`, `app_email`, `source_link` updated to Axina Group values.
 - **pyproject.toml**: author → `Axina Group Inc.`, description → `ERP System Built on the Frappe Framework`.
 - **package.json**: author, homepage, description updated.
@@ -304,10 +326,10 @@ Companies re-created via API provisioner (`infrastructure/axerp-api/create_compa
 To sync a new upstream release:
 
 ```bash
-cd /Users/dzbrody/Dev/GitHub/AXERP
+cd /Users/dzbrody/Dev/GitHub/axerp
 bash scripts/sync_upstream.sh v16.X.Y
 # Resolve any conflicts, then update this changelog.
 # Create PR: version-16 → production
 ```
 
-See `xgc_github_erpsync.md` and `.kiro/steering/upstream-sync.md` for the full workflow.
+See `axerp_github_erpsync.md` and `.kiro/steering/upstream-sync.md` for the full workflow.

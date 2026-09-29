@@ -6,7 +6,7 @@ app_icon = "fa fa-th"
 app_color = "#f9720a"
 app_email = "db@axinagroup.com"
 app_license = "GNU General Public License (v3)"
-source_link = "https://github.com/AXERP/axerp"
+source_link = "https://github.com/axinagroup/axerp"
 app_logo_url = "/assets/erpnext/images/erpnext-logo.svg"
 app_home = "/desk"
 
@@ -64,6 +64,12 @@ setup_wizard_requires = "assets/erpnext/js/setup_wizard.js"
 setup_wizard_stages = "erpnext.setup.setup_wizard.setup_wizard.get_setup_stages"
 
 after_install = "erpnext.setup.install.after_install"
+
+after_app_install = "erpnext.setup.install.after_app_install"
+after_app_uninstall = "erpnext.setup.install.after_app_uninstall"
+
+# patches that must stop the migration when they fail, even with `bench migrate --skip-failing`
+never_skip_patches = ["erpnext.patches.v16_0.update_serial_batch_entries"]
 
 boot_session = "erpnext.startup.boot.boot_session"
 notification_config = "erpnext.startup.notifications.get_notification_config"
@@ -430,8 +436,6 @@ scheduler_events = {
 	"cron": {
 		"0/15 * * * *": [
 			"erpnext.manufacturing.doctype.bom_update_log.bom_update_log.resume_bom_cost_update_jobs",
-		],
-		"0/30 * * * *": [
 			"erpnext.stock.doctype.repost_item_valuation.repost_item_valuation.run_parallel_reposting",
 		],
 		# Hourly but offset by 30 minutes
@@ -446,6 +450,7 @@ scheduler_events = {
 	],
 	"hourly_long": [],
 	"hourly_maintenance": [
+		"erpnext.crm.doctype.appointment.appointment.handle_expired_unverified_appointments",
 		"erpnext.stock.doctype.repost_item_valuation.repost_item_valuation.repost_entries",
 		"erpnext.utilities.bulk_transaction.retry",
 		"erpnext.projects.doctype.project.project.collect_project_status",
@@ -489,6 +494,7 @@ scheduler_events = {
 	],
 	"weekly": [
 		"erpnext.accounts.utils.auto_create_exchange_rate_revaluation_weekly",
+		"erpnext.stock.doctype.stock_reposting_settings.stock_reposting_settings.repost_incorrect_valuation_entries",
 	],
 	"monthly_long": [
 		"erpnext.accounts.deferred_revenue.process_deferred_accounting",
@@ -556,6 +562,7 @@ accounting_dimension_doctypes = [
 	"Purchase Taxes and Charges",
 	"Shipping Rule",
 	"Landed Cost Item",
+	"Landed Cost Taxes and Charges",
 	"Asset Value Adjustment",
 	"Asset Repair",
 	"Asset Capitalization",
@@ -616,16 +623,16 @@ regional_overrides = {
 		"erpnext.controllers.accounts_controller.validate_regional": "erpnext.regional.italy.utils.sales_invoice_validate",
 	},
 }
-user_privacy_documents = [
+user_data_fields = [
 	{
 		"doctype": "Lead",
-		"match_field": "email_id",
-		"personal_fields": ["phone", "mobile_no", "fax", "website", "lead_name"],
+		"filter_by": "email_id",
+		"redact_fields": ["phone", "mobile_no", "fax", "website", "lead_name"],
 	},
 	{
 		"doctype": "Opportunity",
-		"match_field": "contact_email",
-		"personal_fields": ["contact_mobile", "contact_display", "customer_name"],
+		"filter_by": "contact_email",
+		"redact_fields": ["contact_mobile", "contact_display", "customer_name"],
 	},
 ]
 

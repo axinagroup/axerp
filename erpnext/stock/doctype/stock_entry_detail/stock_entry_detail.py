@@ -35,7 +35,6 @@ class StockEntryDetail(Document):
 		has_item_scanned: DF.Check
 		image: DF.Attach | None
 		is_finished_item: DF.Check
-		is_legacy_scrap_item: DF.Check
 		item_code: DF.Link
 		item_group: DF.Data | None
 		item_name: DF.Data | None
@@ -47,6 +46,7 @@ class StockEntryDetail(Document):
 		parent: DF.Data
 		parentfield: DF.Data
 		parenttype: DF.Data
+		pick_list_item: DF.Link | None
 		po_detail: DF.Data | None
 		project: DF.Link | None
 		putaway_rule: DF.Link | None
@@ -67,8 +67,9 @@ class StockEntryDetail(Document):
 		t_warehouse: DF.Link | None
 		transfer_qty: DF.Float
 		transferred_qty: DF.Float
-		type: DF.Literal["", "Co-Product", "By-Product", "Scrap", "Additional Finished Good"]
+		secondary_item_type: DF.Literal["", "Co-Product", "By-Product", "Scrap", "Additional Finished Good"]
 		uom: DF.Link
+		valuation_type: DF.Literal["", "Valuation Rate", "% of Component Cost", "Manual"]
 		use_serial_batch_fields: DF.Check
 		valuation_rate: DF.Currency
 	# end: auto-generated types

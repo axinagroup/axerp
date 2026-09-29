@@ -23,7 +23,7 @@
 set -euo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
-EC2_INSTANCE="i-07bb8581203e52527"
+EC2_INSTANCE="i-08de3cab7640d0c62"
 AWS_REGION="us-east-1"
 AWS_ACCOUNT="010438486646"
 ECR_REGISTRY="${AWS_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
@@ -91,9 +91,9 @@ print(json.dumps(lines))
 }
 
 poll_background_build() {
-  log "Polling EC2 build (allow ~25 min)..."
+  log "Polling EC2 build (allow ~45 min)..."
   local elapsed=0
-  while [[ $elapsed -lt 1800 ]]; do
+  while [[ $elapsed -lt 2700 ]]; do
     sleep 30; elapsed=$((elapsed + 30))
 
     local poll_id
@@ -179,7 +179,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
 CURRENT_BRANCH=$(git branch --show-current)
-[[ "$CURRENT_BRANCH" != "production" ]] && warn "On branch ${CURRENT_BRANCH} — packaging origin/production"
+[[ "$CURRENT_BRANCH" != "production" ]] && warn "On branch ${CURRENT_BRANCH} — packaging origin/${CURRENT_BRANCH}"
 
 # Detect image tag from the compose file (source of truth for what gets deployed),
 # falling back to the Dockerfile build comment. Reading the compose file avoids
@@ -204,13 +204,13 @@ log "EC2:        ${EC2_INSTANCE}"
 $DRY_RUN && warn "DRY RUN — no changes"
 echo ""
 
-# ── Step 1: Package production branch ────────────────────────────────────────
-log "Step 1/7 — Package production branch → S3"
+# ── Step 1: Package the branch being deployed ────────────────────────────────
+log "Step 1/7 — Package origin/${CURRENT_BRANCH} → S3"
 
 # Always fetch first — without this, git archive uses a stale cached local ref
 # (the known production failure: tarball packaged the pre-merge Dockerfile)
-run git fetch origin production
-run git archive origin/production \
+run git fetch origin "${CURRENT_BRANCH}"
+run git archive "origin/${CURRENT_BRANCH}" \
   --format=tar.gz -o /tmp/axerp-production.tar.gz --prefix=axerp/
 
 log "  Tarball: $(du -sh /tmp/axerp-production.tar.gz 2>/dev/null | cut -f1)"
@@ -331,10 +331,10 @@ DB_PASS=\$(docker exec axerp-backend python3 -c \
   "import json; c=json.load(open('/home/frappe/frappe-bench/sites/\${SITE}/site_config.json')); print(c['db_password'])" 2>/dev/null)
 if [ -n "\$DB_NAME" ]; then
   DEMO_COUNT=\$(docker exec axerp-mariadb mysql -u "\$DB_NAME" -p"\$DB_PASS" "\$DB_NAME" \
-    -sN -e "SELECT COUNT(*) FROM \`tabNavbar Item\` WHERE parentfield='settings_dropdown' AND item_label='Delete Demo Data';" 2>/dev/null || echo "0")
+    -sN -e 'SELECT COUNT(*) FROM \`tabNavbar Item\` WHERE parentfield='\''settings_dropdown'\'' AND item_label='\''Delete Demo Data'\'';' 2>/dev/null || echo "0")
   if [ "\$DEMO_COUNT" != "0" ] && [ "\$DEMO_COUNT" != "" ]; then
     docker exec axerp-mariadb mysql -u "\$DB_NAME" -p"\$DB_PASS" "\$DB_NAME" \
-      -e "DELETE FROM \`tabNavbar Item\` WHERE parentfield='settings_dropdown' AND item_label='Delete Demo Data';" 2>/dev/null
+      -e 'DELETE FROM \`tabNavbar Item\` WHERE parentfield='\''settings_dropdown'\'' AND item_label='\''Delete Demo Data'\'';' 2>/dev/null
     echo "  Removed 'Delete Demo Data' navbar item (was causing GET /undefined 404)"
   else
     echo "  Navbar items: OK (no icon-less demo items found)"
@@ -368,13 +368,10 @@ EOBUILD
 cat > /tmp/axerp-launch.sh << 'EOLAUNCH'
 #!/bin/bash
 rm -f /tmp/axerp-deploy-status /tmp/axerp-deploy-run.log
-(
-  bash /tmp/axerp-deploy-run.sh > /tmp/axerp-deploy-run.log 2>&1
-  echo $? > /tmp/axerp-deploy-status
-) &
-BGPID=$!
-echo "Launched build PID $BGPID"
-disown $BGPID
+# New session so SSM does not wait on the build and hit its 10 minute cap.
+setsid nohup bash /tmp/axerp-deploy-run.sh > /tmp/axerp-deploy-run.log 2>&1 < /dev/null &
+echo $! > /tmp/axerp-deploy.pid
+echo "Launched build PID $(cat /tmp/axerp-deploy.pid)"
 EOLAUNCH
 
 if ! $DRY_RUN; then
@@ -388,17 +385,22 @@ echo ""
 if $SKIP_BUILD; then
   warn "Step 3/7 — Skipped (--skip-build)"
 else
+  # Keep pkill in its own command. Wrapping it in bash -lc together with the
+  # s3 paths puts axerp-deploy-run.sh in that bash argv, and pkill SIGTERMs
+  # itself (SSM exit 143, "Terminated").
   ssm_run "Step 3a/7 — Stage scripts on EC2 (kill stale builds first)" \
-    "pkill -f axerp-deploy-run.sh 2>/dev/null; echo 'Killed stale builds (if any)'" \
-    "aws s3 cp s3://${S3_BUCKET}/${S3_PREFIX}/axerp-deploy-run.sh /tmp/axerp-deploy-run.sh --quiet" \
-    "aws s3 cp s3://${S3_BUCKET}/${S3_PREFIX}/axerp-launch.sh /tmp/axerp-launch.sh --quiet" \
+    "pkill -f '[a]xerp-deploy-run.sh' >/dev/null 2>&1 || true" \
+    "echo Killed stale builds" \
+    "aws s3 cp s3://${S3_BUCKET}/${S3_PREFIX}/axerp-deploy-run.sh /tmp/axerp-deploy-run.sh" \
+    "aws s3 cp s3://${S3_BUCKET}/${S3_PREFIX}/axerp-launch.sh /tmp/axerp-launch.sh" \
     "chmod +x /tmp/axerp-deploy-run.sh /tmp/axerp-launch.sh" \
-    "rm -f /tmp/axerp-deploy-status /tmp/axerp-deploy-run.log"
+    "rm -f /tmp/axerp-deploy-status /tmp/axerp-deploy-run.log" \
+    "test -s /tmp/axerp-launch.sh && echo STAGED"
 
   ssm_run "Step 3b/7 — Launch background build" \
     "bash /tmp/axerp-launch.sh" \
     "sleep 5" \
-    "if pgrep -f axerp-deploy-run.sh > /dev/null; then echo BUILD_RUNNING; else echo LAUNCH_FAILED && exit 1; fi"
+    "if pgrep -f '[a]xerp-deploy-run.sh' > /dev/null; then echo BUILD_RUNNING; else echo LAUNCH_FAILED && exit 1; fi"
 
   if ! $DRY_RUN; then
     poll_background_build

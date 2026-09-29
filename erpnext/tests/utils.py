@@ -184,6 +184,7 @@ class BootStrapTestData:
 		self.make_loyalty_program()
 		self.make_shareholder()
 		self.make_sales_taxes_template()
+		self.make_purchase_taxes_template()
 		self.make_workstation()
 		self.make_operation()
 		self.make_bom()
@@ -462,6 +463,7 @@ class BootStrapTestData:
 				"new_password": "Eastern_43A1W",
 				"roles": [
 					{"doctype": "Has Role", "parentfield": "roles", "role": "_Test Role"},
+					{"doctype": "Has Role", "parentfield": "roles", "role": "Accounts User"},
 					{"doctype": "Has Role", "parentfield": "roles", "role": "System Manager"},
 				],
 			},
@@ -2335,6 +2337,29 @@ class BootStrapTestData:
 					}
 				],
 			},
+		]
+		self.make_records(["title", "company"], records)
+
+	def make_purchase_taxes_template(self):
+		records = [
+			{
+				"company": "_Test Company",
+				"doctype": "Purchase Taxes and Charges Template",
+				"title": "_Test Purchase Taxes and Charges Template",
+				"taxes": [
+					{
+						"account_head": "_Test Account VAT - _TC",
+						"add_deduct_tax": "Add",
+						"category": "Total",
+						"charge_type": "On Net Total",
+						"cost_center": "Main - _TC",
+						"description": "VAT",
+						"doctype": "Purchase Taxes and Charges",
+						"parentfield": "taxes",
+						"rate": 6,
+					}
+				],
+			}
 		]
 		self.make_records(["title", "company"], records)
 

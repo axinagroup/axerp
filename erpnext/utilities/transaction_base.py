@@ -10,7 +10,7 @@ from frappe.utils import cint, flt, get_time, now_datetime
 from erpnext.accounts.doctype.accounting_dimension.accounting_dimension import get_dimensions
 from erpnext.controllers.status_updater import StatusUpdater
 from erpnext.stock.get_item_details import NOT_APPLICABLE_TAX, get_item_details
-from erpnext.stock.utils import get_incoming_rate
+from erpnext.stock.utils import _get_incoming_rate
 
 
 class UOMMustBeIntegerError(frappe.ValidationError):
@@ -344,18 +344,31 @@ class TransactionBase(StatusUpdater):
 					"child_doctype": item.get("doctype"),
 					"child_docname": item.get("name"),
 					"is_old_subcontracting_flow": self.get("is_old_subcontracting_flow"),
+					"use_serial_batch_fields": item.get("use_serial_batch_fields"),
 				}
 			),
 			self,
 		)
 
 	@frappe.whitelist()
-	def process_item_selection(self, item_idx):
+	def process_item_selection(self, item_idx: int, reset_item_details: bool = False):
 		# Server side 'item' doc. Update this to reflect in UI
 		item_obj = self.get("items", {"idx": item_idx})[0]
 
 		if not item_obj.item_code:
 			return
+
+		if cint(reset_item_details):
+			# Do not carry item-specific values from the previously selected item.
+			for fieldname in (
+				"weight_per_unit",
+				"weight_uom",
+				"uom",
+				"conversion_factor",
+				"barcode",
+				"pricing_rules",
+			):
+				item_obj.set(fieldname, None)
 
 		# 'item_details' has latest item related values
 		item_details = self.fetch_item_details(item_obj)
@@ -414,7 +427,7 @@ class TransactionBase(StatusUpdater):
 					}
 				)
 
-			rate = get_incoming_rate(args=args)
+			rate = _get_incoming_rate(args=args)
 			item_obj.rate = rate * item_obj.conversion_factor
 		else:
 			self.set_rate_based_on_price_list(item_obj, item_details)
@@ -548,7 +561,9 @@ class TransactionBase(StatusUpdater):
 		from erpnext.stock.get_item_details import apply_price_list
 
 		args = {
-			"items": [x.as_dict() for x in self.items],
+			# pass child_docname so the maintain-same-rate lock in apply_price_list can
+			# match each row, consistent with the desk (JS) callers
+			"items": [{**x.as_dict(), "child_docname": x.name} for x in self.items],
 			"customer": self.customer or self.party_name,
 			"quotation_to": self.quotation_to,
 			"customer_group": self.customer_group,

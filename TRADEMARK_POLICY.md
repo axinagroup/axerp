@@ -1,6 +1,6 @@
 ## Logo and Trademark Policy
 
-The brand name AXERP and the logo are trademarks of Axina Group Inc.......
+The brand name AXERP and the logo are trademarks of Axina Group Inc.
 
 ### Introduction
 

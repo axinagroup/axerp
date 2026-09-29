@@ -478,6 +478,7 @@
   },
   {
    "collapsible": 1,
+   "collapsible_depends_on": "eval:doc.currency && doc.currency != erpnext.get_currency(doc.company)",
    "fieldname": "currency_and_price_list",
    "fieldtype": "Section Break",
    "hide_days": 1,
@@ -893,13 +894,15 @@
    "print_hide": 1
   },
   {
+   "description": "Applying a Discount Amount? When this Sales Order is partially fulfilled through multiple Delivery Notes and Sales Invoices, the Discount Amount is allocated on a FIFO basis. The earlier transactions receive a larger share of the discount. To spread the discount proportionally across item prices, use Additional Discount Percentage instead.",
    "fieldname": "discount_amount",
    "fieldtype": "Currency",
    "hide_days": 1,
    "hide_seconds": 1,
    "label": "Additional Discount Amount",
    "options": "currency",
-   "print_hide": 1
+   "print_hide": 1,
+   "show_description_on_click": 1
   },
   {
    "fieldname": "base_grand_total",
@@ -1760,7 +1763,7 @@
  "idx": 105,
  "is_submittable": 1,
  "links": [],
- "modified": "2026-05-28 11:41:11.823034",
+ "modified": "2026-09-16 11:42:07.000000",
  "modified_by": "Administrator",
  "module": "Selling",
  "name": "Sales Order",
@@ -1827,6 +1830,14 @@
    "read": 1,
    "role": "Sales Manager",
    "write": 1
+  },
+  {
+   "role": "Projects Manager",
+   "select": 1
+  },
+  {
+   "role": "Projects User",
+   "select": 1
   }
  ],
  "row_format": "Dynamic",
