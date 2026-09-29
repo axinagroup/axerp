@@ -13,14 +13,14 @@ This document describes the initial setup for syncing the AXERP fork with the up
   It also embeds the "never rebrand erpnext_integrations" rule with a fix command if modules.txt gets corrupted. You can invoke it anytime with /axerp-sync.
 
   *The claude skill is performing all the fuction below to update the erpnext to axerp.*
-  
+
 
   ---
 
 
 > **Note:** For ongoing sync operations, use `scripts/sync_upstream.sh`. See `.kiro/steering/upstream-sync.md` for the full workflow.
 
-## Initial Repository Setup
+## Initial Rep/comository Setup
 
 If you have already cloned the repository and are inside the `axerp` directory, you do **not** need to clone again.
 
