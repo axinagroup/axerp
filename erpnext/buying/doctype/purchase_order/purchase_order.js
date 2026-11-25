@@ -45,11 +45,7 @@ frappe.ui.form.on("Purchase Order", {
 
 		frm.set_query("fg_item", "items", function () {
 			return {
-				filters: {
-					is_stock_item: 1,
-					is_sub_contracted_item: 1,
-					default_bom: ["!=", ""],
-				},
+				query: "erpnext.controllers.queries.subcontracted_item_query",
 			};
 		});
 	},
@@ -443,23 +439,17 @@ erpnext.buying.PurchaseOrderController = class PurchaseOrderController extends (
 						);
 					}
 
-					if (doc.docstatus === 1 && !doc.inter_company_order_reference) {
-						let me = this;
-						let internal = me.frm.doc.is_internal_supplier;
-						if (internal) {
-							let button_label =
-								me.frm.doc.company === me.frm.doc.represents_company
-									? __("Internal Sales Order")
-									: __("Inter Company Sales Order");
+					if (doc.docstatus === 1 && doc.is_internal_supplier) {
+						let button_label =
+							doc.company === doc.represents_company
+								? __("Internal Sales Order")
+								: __("Inter Company Sales Order");
 
-							me.frm.add_custom_button(
-								button_label,
-								function () {
-									me.make_inter_company_order(me.frm);
-								},
-								__("Create")
-							);
-						}
+						this.add_inter_company_order_button(
+							button_label,
+							"Sales Order",
+							"purchase_order_item"
+						);
 					}
 				}
 
@@ -562,7 +552,7 @@ erpnext.buying.PurchaseOrderController = class PurchaseOrderController extends (
 					},
 					get_query_filters: {
 						docstatus: 1,
-						status: ["not in", ["Stopped", "Expired"]],
+						status: ["not in", ["Stopped", "Ordered", "Expired"]],
 					},
 					allow_child_item_selection: true,
 					child_fieldname: "items",
@@ -608,7 +598,7 @@ erpnext.buying.PurchaseOrderController = class PurchaseOrderController extends (
 						var item_length = me.frm.doc.items.length;
 						while (i < item_length) {
 							var qty = me.frm.doc.items[i].qty;
-							(r.message[0] || []).forEach(function (d) {
+							(r.message || []).forEach(function (d) {
 								if (
 									d.qty > 0 &&
 									qty > 0 &&
@@ -701,8 +691,7 @@ erpnext.buying.PurchaseOrderController = class PurchaseOrderController extends (
 					reqd: 1,
 				},
 			],
-			primary_action: function () {
-				var data = d.get_values();
+			primary_action: function (data) {
 				let reason_for_hold = "Reason for hold: " + data.reason_for_hold;
 
 				frappe.call({

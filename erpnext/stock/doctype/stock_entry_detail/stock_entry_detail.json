@@ -1,5 +1,6 @@
 {
  "actions": [],
+ "allow_bulk_edit": 1,
  "autoname": "hash",
  "creation": "2022-02-05 00:17:49.860824",
  "doctype": "DocType",
@@ -18,8 +19,8 @@
   "item_name",
   "col_break2",
   "is_finished_item",
-  "is_legacy_scrap_item",
-  "type",
+  "valuation_type",
+  "secondary_item_type",
   "quality_inspection",
   "subcontracted_item",
   "against_fg",
@@ -72,6 +73,7 @@
   "col_break6",
   "material_request",
   "material_request_item",
+  "pick_list_item",
   "original_item",
   "reference_section",
   "against_stock_entry",
@@ -127,7 +129,6 @@
    "bold": 1,
    "fieldname": "item_code",
    "fieldtype": "Link",
-   "in_global_search": 1,
    "in_list_view": 1,
    "label": "Item Code",
    "oldfieldname": "item_code",
@@ -143,7 +144,6 @@
   {
    "fieldname": "item_name",
    "fieldtype": "Data",
-   "in_global_search": 1,
    "label": "Item Name",
    "print_hide": 1,
    "read_only": 1
@@ -194,6 +194,7 @@
    "bold": 1,
    "fieldname": "basic_rate",
    "fieldtype": "Currency",
+   "in_import_template": 1,
    "in_list_view": 1,
    "label": "Basic Rate (as per Stock UOM)",
    "non_negative": 1,
@@ -254,6 +255,7 @@
    "label": "Conversion Factor",
    "oldfieldname": "conversion_factor",
    "oldfieldtype": "Currency",
+   "precision": "9",
    "print_hide": 1,
    "reqd": 1
   },
@@ -345,7 +347,6 @@
    "print_hide": 1
   },
   {
-   "default": ":Company",
    "depends_on": "eval:cint(erpnext.is_perpetual_inventory_enabled(parent.company))",
    "fieldname": "cost_center",
    "fieldtype": "Link",
@@ -423,6 +424,17 @@
    "options": "Material Request Item",
    "print_hide": 1,
    "read_only": 1
+  },
+  {
+   "fieldname": "pick_list_item",
+   "fieldtype": "Link",
+   "hidden": 1,
+   "label": "Pick List Item",
+   "no_copy": 1,
+   "options": "Pick List Item",
+   "print_hide": 1,
+   "read_only": 1,
+   "search_index": 1
   },
   {
    "fieldname": "original_item",
@@ -506,7 +518,8 @@
    "fieldname": "project",
    "fieldtype": "Link",
    "label": "Project",
-   "options": "Project"
+   "options": "Project",
+   "search_index": 1
   },
   {
    "fieldname": "po_detail",
@@ -559,7 +572,7 @@
   },
   {
    "default": "0",
-   "depends_on": "eval:!doc.is_legacy_scrap_item && !doc.type",
+   "depends_on": "eval:!doc.valuation_type && !doc.secondary_item_type",
    "fieldname": "is_finished_item",
    "fieldtype": "Check",
    "label": "Is Finished Item",
@@ -652,11 +665,12 @@
    "set_only_once": 1
   },
   {
-   "depends_on": "eval:parent.purpose == \"Manufacture\" && doc.t_warehouse && !doc.is_finished_item && !doc.is_legacy_scrap_item",
-   "fieldname": "type",
+   "depends_on": "eval:parent.purpose == \"Manufacture\" && doc.t_warehouse && !doc.is_finished_item",
+   "fieldname": "secondary_item_type",
    "fieldtype": "Select",
    "label": "Type",
-   "options": "\nCo-Product\nBy-Product\nScrap\nAdditional Finished Good"
+   "options": "\nCo-Product\nBy-Product\nScrap\nAdditional Finished Good",
+   "read_only_depends_on": "eval:doc.bom_secondary_item"
   },
   {
    "fieldname": "bom_secondary_item",
@@ -666,12 +680,12 @@
    "read_only": 1
   },
   {
-   "default": "0",
-   "depends_on": "is_legacy_scrap_item",
-   "fieldname": "is_legacy_scrap_item",
-   "fieldtype": "Check",
-   "label": "Is Legacy Scrap Item",
-   "read_only": 1
+   "depends_on": "secondary_item_type",
+   "fieldname": "valuation_type",
+   "fieldtype": "Select",
+   "label": "Valuation Type",
+   "options": "\nValuation Rate\n% of Component Cost\nManual",
+   "read_only_depends_on": "eval:!doc.secondary_item_type || doc.bom_secondary_item"
   }
  ],
  "grid_page_length": 50,
@@ -679,7 +693,7 @@
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2026-06-30 12:18:34.132425",
+ "modified": "2026-11-11 09:30:00.000000",
  "modified_by": "Administrator",
  "module": "Stock",
  "name": "Stock Entry Detail",

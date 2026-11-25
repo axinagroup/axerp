@@ -14,6 +14,8 @@ frappe.ui.form.on("Batch", {
 		});
 	},
 	refresh: (frm) => {
+		frm.batch_dashboard_request_id = (frm.batch_dashboard_request_id || 0) + 1;
+
 		if (!frm.is_new()) {
 			frm.add_custom_button(__("View Ledger"), () => {
 				frappe.route_options = {
@@ -57,6 +59,8 @@ frappe.ui.form.on("Batch", {
 		);
 	},
 	make_dashboard: (frm) => {
+		const request_id = frm.batch_dashboard_request_id;
+
 		if (!frm.is_new()) {
 			let for_stock_levels = 0;
 			if (!frm.doc.batch_qty && frm.doc.expiry_date) {
@@ -73,6 +77,10 @@ frappe.ui.form.on("Batch", {
 					ignore_reserved_stock: 1,
 				},
 				callback: (r) => {
+					if (request_id !== frm.batch_dashboard_request_id) {
+						return;
+					}
+
 					if (!r.message || r.message.length === 0) {
 						frm.dashboard.add_comment(__("No stock available for this batch."), "Blue", true);
 						return;
@@ -90,17 +98,18 @@ frappe.ui.form.on("Batch", {
 					// show
 					(r.message || []).forEach(function (d) {
 						if (d.qty != 0) {
+							const warehouse = frappe.utils.escape_html(d.warehouse);
 							$(`<div class='row' style='margin-bottom: 10px;'>
-								<div class='col-sm-3 small' style='padding-top: 3px;'>${d.warehouse}</div>
+								<div class='col-sm-3 small' style='padding-top: 3px;'>${warehouse}</div>
 								<div class='col-sm-3 small text-right' style='padding-top: 3px;'>${d.qty}</div>
 								<div class='col-sm-6'>
 									<button class='btn btn-default btn-xs btn-move' style='margin-right: 7px;'
 										data-qty = "${d.qty}"
-										data-warehouse = "${d.warehouse}">
+										data-warehouse = "${warehouse}">
 										${__("Move")}</button>
 									<button class='btn btn-default btn-xs btn-split'
 										data-qty = "${d.qty}"
-										data-warehouse = "${d.warehouse}">
+										data-warehouse = "${warehouse}">
 										${__("Split")}</button>
 								</div>
 							</div>`).appendTo(rows);

@@ -1,51 +1,8 @@
 import frappe
 
-
-@frappe.whitelist()
-def get_last_interaction(contact=None, lead=None):
-	if not contact and not lead:
-		return
-
-	last_communication = None
-	last_issue = None
-	if contact:
-		query_condition = ""
-		values = []
-		contact = frappe.get_doc("Contact", contact)
-		for link in contact.links:
-			if link.link_doctype == "Customer":
-				last_issue = get_last_issue_from_customer(link.link_name)
-			query_condition += "(`reference_doctype`=%s AND `reference_name`=%s) OR"
-			values += [link.link_doctype, link.link_name]
-
-		if query_condition:
-			# remove extra appended 'OR'
-			query_condition = query_condition[:-2]
-			last_communication = frappe.db.sql(
-				f"""
-				SELECT `name`, `content`
-				FROM `tabCommunication`
-				WHERE `sent_or_received`='Received'
-				AND ({query_condition})
-				ORDER BY `creation`
-				LIMIT 1
-			""",
-				values,
-				as_dict=1,
-			)  # nosec
-
-	if lead:
-		last_communication = frappe.get_all(
-			"Communication",
-			filters={"reference_doctype": "Lead", "reference_name": lead, "sent_or_received": "Received"},
-			fields=["name", "content"],
-			order_by="`creation` DESC",
-			limit=1,
-		)
-
-	last_communication = last_communication[0] if last_communication else None
-
-	return {"last_communication": last_communication, "last_issue": last_issue}
+# Phone numbers are compared on their last 10 digits, so that country and trunk prefixes are ignored.
+PHONE_NUMBER_MATCH_LENGTH = 10
+MINIMUM_PHONE_NUMBER_LENGTH = 7
 
 
 def get_last_issue_from_customer(customer_name):
@@ -64,6 +21,12 @@ def get_scheduled_employees_for_popup(communication_medium):
 	if not communication_medium:
 		return []
 
+	medium = frappe.db.get_value(
+		"Communication Medium", communication_medium, ["disabled", "catch_all"], as_dict=True
+	)
+	if medium and medium.disabled:
+		return []
+
 	now_time = frappe.utils.nowtime()
 	weekday = frappe.utils.get_weekday()
 
@@ -79,22 +42,56 @@ def get_scheduled_employees_for_popup(communication_medium):
 	)
 
 	available_employee_groups = tuple([emp.employee_group for emp in available_employee_groups])
+	if not available_employee_groups and medium and medium.catch_all:
+		available_employee_groups = (medium.catch_all,)
+	if not available_employee_groups:
+		return set()
 
-	employees = frappe.get_all(
-		"Employee Group Table", filters={"parent": ["in", available_employee_groups]}, fields=["user_id"]
+	member = frappe.qb.DocType("Employee Group Table")
+	employee = frappe.qb.DocType("Employee")
+	return set(
+		frappe.qb.from_(member)
+		.join(employee)
+		.on(member.employee == employee.name)
+		.select(employee.user_id)
+		.where(member.parent.isin(available_employee_groups))
+		.where(employee.status == "Active")
+		.where(employee.user_id.isnotnull() & (employee.user_id != ""))
+		.run(pluck=True)
 	)
 
-	employee_emails = set([employee.user_id for employee in employees])
 
-	return employee_emails
+def strip_number(number: str | None) -> str | None:
+	"""Return only the digits of the number, without leading zeros.
 
-
-def strip_number(number):
+	eg. "+91 78883-83332" becomes "917888383332" and "07888383332" becomes "7888383332"
+	"""
 	if not number:
 		return
-	# strip + and 0 from the start of the number for proper number comparisions
-	# eg. +7888383332 should match with 7888383332
-	# eg. 07888383332 should match with 7888383332
-	number = number.lstrip("+")
-	number = number.lstrip("0")
-	return number
+	return "".join(character for character in number if character.isdigit()).lstrip("0")
+
+
+def get_phone_number_key(number: str | None) -> str | None:
+	"""Return the last digits used to compare phone numbers, or None if the number is too short to match."""
+	digits = strip_number(number)
+	if not digits or len(digits) < MINIMUM_PHONE_NUMBER_LENGTH:
+		return None
+	return digits[-PHONE_NUMBER_MATCH_LENGTH:]
+
+
+def get_phone_number_like_pattern(key: str) -> str:
+	"""Return a broad LIKE pattern for stored numbers containing the key's last digits, in any format."""
+	return "%" + "%".join(key[-MINIMUM_PHONE_NUMBER_LENGTH:]) + "%"
+
+
+def get_contacts_with_phone_number(number: str | None) -> list[str]:
+	"""Return all contacts with a phone number matching the given number."""
+	if not (key := get_phone_number_key(number)):
+		return []
+
+	phones = frappe.get_all(
+		"Contact Phone",
+		filters={"parenttype": "Contact", "phone": ["like", get_phone_number_like_pattern(key)]},
+		fields=["parent", "phone"],
+	)
+	return list(dict.fromkeys(phone.parent for phone in phones if get_phone_number_key(phone.phone) == key))

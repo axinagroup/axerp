@@ -8,15 +8,15 @@
   - **GOAL**: Surface counterexamples that demonstrate the bug exists
   - **Scoped PBT Approach**: Scope the property to the concrete failing case - "AXERP Integrations" in modules.txt with actual folder "erpnext_integrations"
   - Test that when `modules.txt` contains "AXERP Integrations", installation fails with ModuleNotFoundError
-  - Test that Python cannot import `erpnext.xgcerp_integrations` but can import `erpnext.erpnext_integrations`
+  - Test that Python cannot import `erpnext.axerp_integrations` but can import `erpnext.erpnext_integrations`
   - Test that `plaid_settings.json` has `"module": "AXERP Integrations"` (mismatched with folder structure)
-  - Test that running `smart_rename.py` on a test copy changes "AXERP Integrations" to "AXERP Integrations"
+  - Test that running `smart_rename.py` on a test copy changes "ERPNext Integrations" to "AXERP Integrations"
   - Run test on UNFIXED code
   - **EXPECTED OUTCOME**: Test FAILS (this is correct - it proves the bug exists)
   - Document counterexamples found:
-    - AXERP installation fails with `ModuleNotFoundError: No module named 'erpnext.xgcerp_integrations'`
-    - Import `erpnext.xgcerp_integrations` fails but `erpnext.erpnext_integrations` succeeds
-    - `smart_rename.py` changes "AXERP Integrations" to "AXERP Integrations" in modules.txt
+    - AXERP installation fails with `ModuleNotFoundError: No module named 'erpnext.axerp_integrations'`
+    - Import `erpnext.axerp_integrations` fails but `erpnext.erpnext_integrations` succeeds
+    - `smart_rename.py` changes "ERPNext Integrations" to "AXERP Integrations" in modules.txt
   - Mark task complete when test is written, run, and failure is documented
   - _Requirements: 2.1, 2.2, 2.3_
 
@@ -25,8 +25,8 @@
   - **IMPORTANT**: Follow observation-first methodology
   - Observe behavior on UNFIXED code for non-buggy inputs (other modules, other rebranding operations)
   - Write property-based tests capturing observed behavior patterns:
-    - For all modules except "AXERP Integrations", installation succeeds
-    - For all "AXERP" patterns except "AXERP Integrations", `smart_rename.py` renames to "AXERP"
+    - For all modules except "ERPNext Integrations", installation succeeds
+    - For all "ERPNext" patterns except "ERPNext Integrations", `smart_rename.py` renames to "AXERP"
     - Existing imports like `from erpnext.erpnext_integrations.doctype.plaid_settings.plaid_settings import ...` resolve correctly
     - All integrations features (Plaid Settings, etc.) function correctly
     - Other JSON module fields (not integrations) are rebranded correctly
@@ -39,17 +39,17 @@
 - [x] 3. Fix for module name mismatch
 
   - [x] 3.1 Revert module name in erpnext/modules.txt
-    - Change line 15 from `AXERP Integrations` to `AXERP Integrations`
+    - Change line 15 from `AXERP Integrations` to `ERPNext Integrations`
     - This restores the correct module name that matches the folder structure `erpnext_integrations/`
     - Allows Frappe to successfully import `erpnext.erpnext_integrations` during installation
-    - _Bug_Condition: input.moduleNameInConfig == "AXERP Integrations" AND input.actualFolderName == "erpnext_integrations" AND input.existingImportStatements CONTAIN "erpnext.erpnext_integrations" AND NOT canImportModule("erpnext.xgcerp_integrations")_
-    - _Expected_Behavior: Installation succeeds, module is importable, modules.txt contains "AXERP Integrations"_
+    - _Bug_Condition: input.moduleNameInConfig == "AXERP Integrations" AND input.actualFolderName == "erpnext_integrations" AND input.existingImportStatements CONTAIN "erpnext.erpnext_integrations" AND NOT canImportModule("erpnext.axerp_integrations")_
+    - _Expected_Behavior: Installation succeeds, module is importable, modules.txt contains "ERPNext Integrations"_
     - _Preservation: All other modules continue to install and function correctly_
     - _Requirements: 2.1, 2.2_
 
   - [x] 3.2 Revert module field in plaid_settings.json
     - Change line 75 in `erpnext/erpnext_integrations/doctype/plaid_settings/plaid_settings.json`
-    - Change `"module": "AXERP Integrations"` to `"module": "AXERP Integrations"`
+    - Change `"module": "AXERP Integrations"` to `"module": "ERPNext Integrations"`
     - Ensures DocType metadata matches the actual module name
     - Maintains consistency across all module references
     - _Bug_Condition: JSON module field doesn't match actual folder structure_
@@ -58,19 +58,19 @@
     - _Requirements: 2.3_
 
   - [x] 3.3 Add exclusion logic to scripts/smart_rename.py
-    - Add constant: `PRESERVE_INTEGRATIONS_MODULE = "AXERP Integrations"`
+    - Add constant: `PRESERVE_INTEGRATIONS_MODULE = "ERPNext Integrations"`
     - Add exclusion logic for modules.txt processing:
       - Read file line by line
-      - Skip rebranding for lines containing "AXERP Integrations"
+      - Skip rebranding for lines containing "ERPNext Integrations"
       - Apply rebranding to all other lines
     - Add exclusion logic for JSON files:
       - Check if file is a DocType JSON (contains `"module":` field)
-      - Skip rebranding for `"module": "AXERP Integrations"` patterns
+      - Skip rebranding for `"module": "ERPNext Integrations"` patterns
       - Apply rebranding to all other content
     - Update file processing loop to apply exclusions
     - Add comments documenting why integrations module must be preserved
     - _Bug_Condition: Script performs global find-and-replace without exclusions, causing recurring bug_
-    - _Expected_Behavior: Script preserves "AXERP Integrations" while rebranding all other content_
+    - _Expected_Behavior: Script preserves "ERPNext Integrations" while rebranding all other content_
     - _Preservation: Script continues to rebrand all other modules and content correctly_
     - _Requirements: 2.4, 2.5, 2.6, 2.7, 2.8_
 
@@ -82,9 +82,9 @@
     - Run bug condition exploration test from step 1
     - Verify AXERP installation succeeds
     - Verify `erpnext.erpnext_integrations` can be imported
-    - Verify modules.txt contains "AXERP Integrations"
-    - Verify plaid_settings.json has `"module": "AXERP Integrations"`
-    - Verify running `smart_rename.py` preserves "AXERP Integrations"
+    - Verify modules.txt contains "ERPNext Integrations"
+    - Verify plaid_settings.json has `"module": "ERPNext Integrations"`
+    - Verify running `smart_rename.py` preserves "ERPNext Integrations"
     - **EXPECTED OUTCOME**: Test PASSES (confirms bug is fixed)
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5_
 

@@ -3,6 +3,17 @@
 
 frappe.provide("erpnext.company");
 
+// Static filters (is_group / disabled / warehouse_type) live in the fields' link_filters.
+const WAREHOUSE_DEFAULT_FIELDS = [
+	"default_warehouse",
+	"sample_retention_warehouse",
+	"default_in_transit_warehouse",
+	"default_warehouse_for_sales_return",
+	"default_wip_warehouse",
+	"default_fg_warehouse",
+	"default_scrap_warehouse",
+];
+
 frappe.ui.form.on("Company", {
 	onload: function (frm) {
 		if (frm.doc.__islocal && frm.doc.parent_company) {
@@ -37,7 +48,7 @@ frappe.ui.form.on("Company", {
 		});
 
 		frm.set_query("default_selling_terms", function () {
-			return { filters: { selling: 1 } };
+			return { filters: { selling: 1, disabled: 0 } };
 		});
 
 		frm.set_query("default_sales_contact", function (doc) {
@@ -48,26 +59,24 @@ frappe.ui.form.on("Company", {
 		});
 
 		frm.set_query("default_buying_terms", function () {
-			return { filters: { buying: 1 } };
+			return { filters: { buying: 1, disabled: 0 } };
 		});
 
-		frm.set_query("default_in_transit_warehouse", function () {
-			return {
-				filters: {
-					warehouse_type: "Transit",
-					is_group: 0,
-					company: frm.doc.company_name,
-				},
-			};
+		WAREHOUSE_DEFAULT_FIELDS.forEach((fieldname) => {
+			frm.set_query(fieldname, function (doc) {
+				return { filters: { company: doc.name } };
+			});
 		});
 
-		frm.set_query("default_warehouse_for_sales_return", function () {
-			return {
-				filters: {
-					company: frm.doc.name,
-					is_group: 0,
-				},
-			};
+		["default_wip_warehouse", "default_fg_warehouse", "default_scrap_warehouse"].forEach((fieldname) => {
+			frm.set_query(fieldname, function (doc) {
+				return {
+					filters: {
+						company: doc.name,
+						is_group: 0,
+					},
+				};
+			});
 		});
 	},
 
@@ -214,7 +223,7 @@ frappe.ui.form.on("Company", {
 								label: __("Please enter the company name to confirm"),
 								reqd: 1,
 								description: __(
-									"Please make sure you really want to delete all the transactions for {0}. Your master data will remain as it is. This action cannot be undone.",
+									"Please make sure you really want to delete all the transactions for {0}. Your master data will remain as it is. Naming series counters will not be reset. This action cannot be undone.",
 									[frappe.utils.bold(frm.doc.name)]
 								),
 							},
@@ -307,6 +316,8 @@ erpnext.company.setup_queries = function (frm) {
 			["default_advance_received_account", { root_type: "Liability", account_type: "Receivable" }],
 			["default_advance_paid_account", { root_type: "Asset", account_type: "Payable" }],
 			["service_expense_account", { root_type: "Expense" }],
+			["expenses_added_to_stock_account", { root_type: "Expense" }],
+			["expenses_added_to_stock_contra_account", { root_type: "Expense" }],
 		],
 		function (i, v) {
 			erpnext.company.set_custom_query(frm, v);

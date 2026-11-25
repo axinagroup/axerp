@@ -1,13 +1,20 @@
 # Copyright (c) 2018, Frappe Technologies Pvt. Ltd. and Contributors
 # See license.txt
+import json
+from unittest.mock import patch
+
 import frappe
-from frappe.utils import add_months, today
+from frappe.utils import add_months, flt, today
 
 from erpnext import get_company_currency
+from erpnext.controllers.accounts_controller import update_child_qty_rate
+from erpnext.controllers.queries import get_blanket_orders
 from erpnext.stock.doctype.item.test_item import make_item
+from erpnext.stock.get_item_details import get_blanket_order_details
 from erpnext.tests.utils import AXERPTestSuite
 
-from .blanket_order import make_order
+from . import blanket_order_pricing
+from .blanket_order import apply_price_list, make_order
 
 
 class TestBlanketOrder(AXERPTestSuite):
@@ -25,6 +32,7 @@ class TestBlanketOrder(AXERPTestSuite):
 		so.submit()
 
 		self.assertEqual(so.doctype, "Sales Order")
+		self.assertNotEqual(so.naming_series, bo.naming_series)
 		self.assertEqual(len(so.get("items")), len(bo.get("items")))
 
 		# check the rate, quantity and updation for the ordered quantity
@@ -50,6 +58,7 @@ class TestBlanketOrder(AXERPTestSuite):
 		po.submit()
 
 		self.assertEqual(po.doctype, "Purchase Order")
+		self.assertNotEqual(po.naming_series, bo.naming_series)
 		self.assertEqual(len(po.get("items")), len(bo.get("items")))
 
 		# check the rate, quantity and updation for the ordered quantity
@@ -91,6 +100,57 @@ class TestBlanketOrder(AXERPTestSuite):
 		frappe.db.set_single_value("Buying Settings", "blanket_order_allowance", 10)
 		po.submit()
 
+	@AXERPTestSuite.change_settings("Buying Settings", {"blanket_order_allowance": 10})
+	def test_blanket_order_allowance_applies_to_blanket_order_qty(self):
+		bo = make_blanket_order(blanket_order_type="Purchasing", quantity=100)
+		orders = [make_purchase_order_against(bo, qty=qty) for qty in (90, 15, 10)]
+		orders[0].submit()
+		orders[1].submit()
+
+		self.assertRaises(frappe.ValidationError, orders[2].submit)
+
+	@AXERPTestSuite.change_settings("Selling Settings", {"blanket_order_allowance": 0})
+	@AXERPTestSuite.change_settings("Buying Settings", {"blanket_order_allowance": 0})
+	@AXERPTestSuite.change_settings(
+		"Stock Settings",
+		{"over_delivery_receipt_allowance": 10, "role_allowed_to_over_deliver_receive": "Stock Manager"},
+	)
+	def test_stock_over_delivery_role_does_not_bypass_blanket_order_allowance(self):
+		test_user = frappe.get_doc("User", "test@example.com")
+		test_user.add_roles("Stock Manager")
+
+		frappe.clear_cache()
+		for blanket_order_type, doctype, date_field in (
+			("Selling", "Sales Order", "delivery_date"),
+			("Purchasing", "Purchase Order", "schedule_date"),
+		):
+			bo = make_blanket_order(blanket_order_type=blanket_order_type, quantity=100)
+			frappe.flags.args.doctype = doctype
+			order = make_order(bo.name)
+			order.currency = get_company_currency(order.company)
+			setattr(order, date_field, today())
+			order.items[0].qty = 110
+
+			with self.set_user("test@example.com"):
+				order.flags.ignore_permissions = True
+				self.assertRaises(frappe.ValidationError, order.submit)
+
+	@AXERPTestSuite.change_settings("Buying Settings", {"blanket_order_allowance": 0})
+	def test_last_fraction_of_blanket_order_can_be_ordered(self):
+		item = make_item(properties={"stock_uom": "Kg", "is_stock_item": 0}).name
+		bo = make_blanket_order(blanket_order_type="Purchasing", quantity=1, item_code=item)
+
+		frappe.flags.args.doctype = "Purchase Order"
+		for qty in (0.9, 0.1):
+			po = make_order(bo.name)
+			po.currency = get_company_currency(po.company)
+			po.schedule_date = today()
+			po.items[0].qty = qty
+			po.submit()
+
+		bo.reload()
+		self.assertEqual(bo.items[0].ordered_qty, 1)
+
 	def test_party_item_code(self):
 		item_doc = make_item("_Test Item 1 for Blanket Order")
 		item_code = item_doc.name
@@ -113,21 +173,509 @@ class TestBlanketOrder(AXERPTestSuite):
 		bo = make_blanket_order(blanket_order_type="Purchasing", supplier=supplier, item_code=item_code)
 		self.assertEqual(bo.items[0].party_item_code, "SUPP-PART-1")
 
+	def test_multicurrency_blanket_order(self):
+		company_currency = get_company_currency("_Test Company")
+		transaction_currency = "USD" if company_currency != "USD" else "EUR"
+		conversion_rate = 80
+		rate = 5
+
+		for blanket_order_type, target_doctypes in (
+			("Selling", ("Sales Order", "Quotation")),
+			("Purchasing", ("Purchase Order",)),
+		):
+			blanket_order = make_blanket_order(
+				blanket_order_type=blanket_order_type,
+				currency=transaction_currency,
+				conversion_rate=conversion_rate,
+				rate=rate,
+			)
+
+			self.assertEqual(blanket_order.currency, transaction_currency)
+			self.assertEqual(blanket_order.conversion_rate, conversion_rate)
+			self.assertEqual(blanket_order.items[0].base_rate, rate * conversion_rate)
+
+			for target_doctype in target_doctypes:
+				with self.subTest(target_doctype=target_doctype):
+					frappe.flags.args.doctype = target_doctype
+					target = make_order(blanket_order.name)
+
+					self.assertEqual(target.currency, transaction_currency)
+					self.assertEqual(target.conversion_rate, conversion_rate)
+					self.assertEqual(target.items[0].rate, rate)
+					self.assertEqual(target.items[0].base_rate, rate * conversion_rate)
+					self.assertEqual(target.items[0].blanket_order_rate, rate)
+					self.assertEqual(target.items[0].blanket_order, blanket_order.name)
+
+	def test_price_list_rates_and_mapping(self):
+		company = "_Test Company"
+		company_currency = get_company_currency(company)
+		transaction_currency = "USD" if company_currency != "USD" else "EUR"
+		conversion_rate = 80
+		price_list_rate = 800
+
+		for blanket_order_type, price_list_field, target_doctypes in (
+			("Selling", "selling_price_list", ("Sales Order", "Quotation")),
+			("Purchasing", "buying_price_list", ("Purchase Order",)),
+		):
+			blanket_order, price_list = make_priced_blanket_order(
+				blanket_order_type=blanket_order_type,
+				company=company,
+				currency=transaction_currency,
+				conversion_rate=conversion_rate,
+				price_list_rate=price_list_rate,
+				qty=1000,
+			)
+			blanket_order.insert()
+			blanket_order.submit()
+
+			expected_rate = price_list_rate / conversion_rate
+			self.assertEqual(blanket_order.price_list_currency, company_currency)
+			self.assertEqual(blanket_order.plc_conversion_rate, 1)
+			self.assertEqual(blanket_order.items[0].price_list_rate, expected_rate)
+			self.assertEqual(blanket_order.items[0].base_price_list_rate, price_list_rate)
+			self.assertEqual(blanket_order.items[0].rate, expected_rate)
+			self.assertEqual(blanket_order.items[0].base_rate, price_list_rate)
+
+			for target_doctype in target_doctypes:
+				with self.subTest(target_doctype=target_doctype):
+					frappe.flags.args.doctype = target_doctype
+					target = make_order(blanket_order.name)
+
+					self.assertEqual(target.get(price_list_field), price_list)
+					self.assertEqual(target.price_list_currency, company_currency)
+					self.assertEqual(target.plc_conversion_rate, 1)
+					self.assertEqual(target.items[0].price_list_rate, expected_rate)
+					self.assertEqual(target.items[0].base_price_list_rate, price_list_rate)
+					self.assertEqual(target.items[0].rate, expected_rate)
+					self.assertEqual(target.items[0].blanket_order, blanket_order.name)
+
+	def test_applying_price_list_ignores_empty_item_rows(self):
+		blanket_order = frappe.new_doc("Blanket Order")
+		blanket_order.blanket_order_type = "Selling"
+		blanket_order.company = "_Test Company"
+		blanket_order.customer = "_Test Customer"
+		blanket_order.from_date = today()
+		blanket_order.append("items", {})
+
+		pricing = apply_price_list(blanket_order.as_dict())
+
+		self.assertEqual(pricing["children"], [])
+
+	def test_applying_price_list_needs_blanket_order_read_permission(self):
+		from erpnext.tests.permission_test_utils import as_user, make_fenced_user
+
+		blanket_order, _price_list = make_priced_blanket_order(price_list_rate=4321.5)
+		expected = apply_price_list(blanket_order.as_dict())
+		self.assertEqual(expected["children"][0]["price_list_rate"], 4321.5)
+
+		for user, roles in (
+			("_test_bo_no_role@example.com", []),
+			("_test_bo_sales@example.com", ["Sales User"]),
+		):
+			with as_user(make_fenced_user(user, roles)):
+				self.assertRaises(frappe.PermissionError, apply_price_list, blanket_order.as_dict())
+
+		with as_user(make_fenced_user("_test_bo_manager@example.com", ["System Manager", "Sales User"])):
+			self.assertEqual(apply_price_list(blanket_order.as_dict()), expected)
+
+	def test_applying_price_list_checks_party_and_user_permissions(self):
+		from erpnext.tests.permission_test_utils import as_user, make_fenced_user
+
+		for order_type, party_type, other_party, party_role in (
+			("Selling", "Customer", "_Test Customer 1", "Sales User"),
+			("Purchasing", "Supplier", "_Test Supplier 1", "Purchase User"),
+		):
+			with self.subTest(order_type=order_type):
+				blanket_order, _price_list = make_priced_blanket_order(order_type, price_list_rate=4321.5)
+				party = blanket_order.get(frappe.scrub(party_type))
+				expected = apply_price_list(blanket_order.as_dict())
+				prefix = f"_test_bo_{order_type.lower()}"
+				denied_users = (
+					make_fenced_user(f"{prefix}_no_party@example.com", ["System Manager"]),
+					make_fenced_user(
+						f"{prefix}_other_company@example.com",
+						["System Manager", party_role],
+						[("Company", "_Test Company 1")],
+					),
+					make_party_reader(
+						f"{prefix}_other_party@example.com", party_role, party_type, other_party
+					),
+				)
+				for user in denied_users:
+					with as_user(user):
+						self.assertRaises(frappe.PermissionError, apply_price_list, blanket_order.as_dict())
+
+				with as_user(make_party_reader(f"{prefix}_party@example.com", party_role, party_type, party)):
+					self.assertEqual(apply_price_list(blanket_order.as_dict()), expected)
+
+	def test_price_list_rate_is_fetched_on_item_selection(self):
+		company = "_Test Company"
+		company_currency = get_company_currency(company)
+		price_list_rate = 800
+		blanket_order, _price_list = make_priced_blanket_order(
+			company=company,
+			currency=company_currency,
+			conversion_rate=1,
+			price_list_rate=price_list_rate,
+			qty=0,
+		)
+		item = blanket_order.items[0]
+
+		self.assertEqual(item.price_list_rate, price_list_rate)
+		self.assertEqual(item.rate, price_list_rate)
+
+	def test_price_list_rates_fetch_item_prices_once(self):
+		blanket_order = new_blanket_order("Selling")
+		blanket_order.selling_price_list = "_Test Price List"
+		for item_code in ("ITEM-1", "ITEM-2"):
+			blanket_order.append("items", {"item_code": item_code, "qty": 1})
+
+		with patch.object(
+			blanket_order_pricing, "get_item_prices_for_stock_uom", return_value={}
+		) as get_item_prices:
+			rates = blanket_order_pricing.get_price_list_rates(blanket_order)
+
+		self.assertEqual(len(rates), 2)
+		get_item_prices.assert_called_once_with(
+			frappe._dict(
+				{
+					"price_list": "_Test Price List",
+					"customer": "_Test Customer",
+					"supplier": None,
+					"transaction_date": blanket_order.from_date,
+				}
+			),
+			["ITEM-1", "ITEM-2"],
+		)
+
+	def test_price_list_conversion_uses_currency_precision(self):
+		company = "_Test Company"
+		company_currency = get_company_currency(company)
+		transaction_currency = "USD" if company_currency != "USD" else "EUR"
+		conversion_rate = 95.47
+		price_list_rate = 100
+		blanket_order, _price_list = make_priced_blanket_order(
+			company=company,
+			currency=transaction_currency,
+			conversion_rate=conversion_rate,
+			price_list_rate=price_list_rate,
+		)
+		item = blanket_order.items[0]
+		expected_rate = flt(price_list_rate / conversion_rate, item.precision("rate"))
+		expected_base_rate = flt(expected_rate * conversion_rate, item.precision("base_rate"))
+
+		self.assertFalse(frappe.get_meta("Blanket Order Item").get_field("rate").precision)
+		self.assertEqual(item.price_list_rate, expected_rate)
+		self.assertEqual(item.base_price_list_rate, expected_base_rate)
+		self.assertEqual(item.rate, expected_rate)
+		self.assertEqual(item.base_rate, expected_base_rate)
+
+		blanket_order.insert()
+		blanket_order.submit()
+
+		frappe.flags.args.doctype = "Sales Order"
+		sales_order = make_order(blanket_order.name)
+		sales_order.delivery_date = today()
+		sales_order.insert()
+
+		self.assertEqual(sales_order.items[0].price_list_rate, item.price_list_rate)
+		self.assertEqual(sales_order.items[0].base_price_list_rate, item.base_price_list_rate)
+		self.assertEqual(sales_order.items[0].rate, item.rate)
+		self.assertEqual(sales_order.items[0].base_rate, item.base_rate)
+
+	def test_applying_price_list_can_reset_conversion_rate(self):
+		company_currency = get_company_currency("_Test Company")
+		transaction_currency = "USD" if company_currency != "USD" else "EUR"
+		blanket_order, _price_list = make_priced_blanket_order(
+			currency=transaction_currency,
+			conversion_rate=80,
+			price_list_rate=100,
+		)
+
+		with patch(
+			"erpnext.manufacturing.doctype.blanket_order.blanket_order_pricing.get_exchange_rate",
+			return_value=95.47,
+		):
+			pricing = apply_price_list(blanket_order.as_dict(), reset_conversion_rate=True)
+
+		self.assertEqual(pricing["parent"]["conversion_rate"], 95.47)
+		expected_rate = flt(
+			100 / pricing["parent"]["conversion_rate"],
+			blanket_order.items[0].precision("rate"),
+		)
+		expected_base_rate = flt(
+			expected_rate * pricing["parent"]["conversion_rate"],
+			blanket_order.items[0].precision("base_rate"),
+		)
+		self.assertEqual(pricing["children"][0]["base_rate"], expected_base_rate)
+
+	def test_blanket_order_lookup_filters_currency(self):
+		company_currency = get_company_currency("_Test Company")
+		transaction_currency = "USD" if company_currency != "USD" else "EUR"
+		blanket_order = make_blanket_order(
+			blanket_order_type="Selling",
+			currency=transaction_currency,
+			conversion_rate=80,
+		)
+
+		filters = {
+			"company": blanket_order.company,
+			"currency": transaction_currency,
+			"blanket_order_type": "Selling",
+			"item": blanket_order.items[0].item_code,
+		}
+		matching_orders = get_blanket_orders("Blanket Order", "", "name", 0, 20, filters)
+		self.assertIn(blanket_order.name, [order[0] for order in matching_orders])
+
+		filters["currency"] = company_currency
+		other_currency_orders = get_blanket_orders("Blanket Order", "", "name", 0, 20, filters)
+		self.assertNotIn(blanket_order.name, [order[0] for order in other_currency_orders])
+
+		details = get_blanket_order_details(
+			{
+				"blanket_order": blanket_order.name,
+				"company": blanket_order.company,
+				"currency": company_currency,
+				"customer": blanket_order.customer,
+				"doctype": "Sales Order",
+				"item_code": blanket_order.items[0].item_code,
+				"transaction_date": today(),
+			}
+		)
+		self.assertFalse(details)
+
+	@AXERPTestSuite.change_settings("Buying Settings", {"blanket_order_allowance": 0})
+	def test_over_order_check_uses_stock_qty(self):
+		item = make_box_item("_Test Blanket Order Box Item")
+		bo = make_blanket_order(blanket_order_type="Purchasing", quantity=100, item_code=item)
+
+		po = make_purchase_order_against(bo, qty=9)
+		po.items[0].uom = "Box"
+		po.items[0].conversion_factor = 12
+		po.items[0].warehouse = "_Test Warehouse - _TC"
+		self.assertRaisesRegex(frappe.ValidationError, "cannot be ordered more than", po.submit)
+
+		po.items[0].qty = 8
+		po.submit()
+		self.assertEqual(frappe.db.get_value("Blanket Order Item", bo.items[0].name, "ordered_qty"), 96)
+
+	def test_blanket_order_rate_applies_per_stock_uom(self):
+		item = make_box_item("_Test Blanket Order Box Item")
+		bo = make_blanket_order(blanket_order_type="Selling", quantity=100, item_code=item, rate=100)
+
+		frappe.flags.args.doctype = "Sales Order"
+		so = make_order(bo.name)
+		so.currency = get_company_currency(so.company)
+		so.delivery_date = today()
+		so.items[0].update(
+			{"qty": 1, "uom": "Box", "conversion_factor": 12, "warehouse": "_Test Warehouse - _TC"}
+		)
+		so.insert()
+
+		so.process_item_selection(item_idx=1)
+		self.assertEqual(so.items[0].blanket_order_rate, 100)
+		self.assertEqual(so.items[0].rate, 1200)
+
+	def test_order_must_match_blanket_order_party_type_and_currency(self):
+		bo = make_blanket_order(blanket_order_type="Purchasing", quantity=100)
+
+		other_party = make_purchase_order_against(bo, qty=4)
+		other_party.supplier = "_Test Supplier 1"
+		self.assertRaisesRegex(frappe.ValidationError, "is for", other_party.insert)
+
+		other_currency = make_purchase_order_against(bo, qty=4)
+		other_currency.currency = "USD"
+		other_currency.conversion_rate = 50
+		self.assertRaisesRegex(frappe.ValidationError, "is in", other_currency.insert)
+
+		selling_bo = make_blanket_order(blanket_order_type="Selling", quantity=100)
+		wrong_type = make_purchase_order_against(bo, qty=4)
+		wrong_type.items[0].blanket_order = selling_bo.name
+		self.assertRaisesRegex(frappe.ValidationError, "cannot be used on", wrong_type.insert)
+
+		make_purchase_order_against(bo, qty=4).insert()
+
+	@AXERPTestSuite.change_settings("Buying Settings", {"blanket_order_allowance": 0})
+	def test_closed_order_keeps_its_received_qty(self):
+		bo = make_blanket_order(blanket_order_type="Purchasing", quantity=100)
+		po = make_purchase_order_against(bo, qty=100)
+		po.submit()
+		receive_purchase_order(po, 80)
+
+		po.reload()
+		po.update_status("Closed")
+		self.assertEqual(blanket_order_ordered_qty(bo), 80)
+		self.assertRaisesRegex(
+			frappe.ValidationError,
+			"cannot be ordered more than",
+			make_purchase_order_against(bo, qty=30).submit,
+		)
+
+		make_purchase_order_against(bo, qty=20).submit()
+		po.reload()
+		self.assertRaisesRegex(
+			frappe.ValidationError, "cannot be ordered more than", po.update_status, "Draft"
+		)
+
+	@AXERPTestSuite.change_settings(
+		"Buying Settings", {"blanket_order_allowance": 0, "allow_multiple_items": 1}
+	)
+	def test_update_items_checks_the_net_change(self):
+		bo = make_blanket_order(blanket_order_type="Purchasing", quantity=100)
+		po = make_purchase_order_against(bo, qty=50)
+		po.append("items", {**po.items[0].as_dict(), "name": None, "idx": None, "qty": 50})
+		po.submit()
+
+		payload = [
+			{
+				"docname": row.name,
+				"item_code": row.item_code,
+				"qty": qty,
+				"rate": row.rate,
+				"uom": row.uom,
+				"conversion_factor": row.conversion_factor,
+				"schedule_date": str(row.schedule_date),
+			}
+			for row, qty in zip(po.items, (40, 60), strict=True)
+		]
+		update_child_qty_rate("Purchase Order", json.dumps(payload), po.name)
+
+		self.assertEqual(
+			[frappe.db.get_value("Purchase Order Item", row.name, "qty") for row in po.items], [40, 60]
+		)
+
+	@AXERPTestSuite.change_settings("Buying Settings", {"blanket_order_allowance": 10})
+	def test_blanket_order_lookup_keeps_order_within_allowance(self):
+		item = make_item("_Test Blanket Order Allowance Lookup Item", {"is_stock_item": 1}).name
+		bo = make_blanket_order(blanket_order_type="Purchasing", quantity=100, rate=90, item_code=item)
+		po = make_purchase_order_against(bo, qty=100)
+		po.items[0].warehouse = "_Test Warehouse - _TC"
+		po.submit()
+
+		details = get_blanket_order_details(
+			{
+				"company": "_Test Company",
+				"currency": bo.currency,
+				"supplier": bo.supplier,
+				"doctype": "Purchase Order",
+				"item_code": item,
+				"transaction_date": today(),
+			}
+		)
+		self.assertEqual(details.blanket_order, bo.name)
+
+	def test_blanket_order_rate_is_set_by_the_server(self):
+		bo = make_blanket_order(blanket_order_type="Purchasing", quantity=100, rate=100)
+		po = make_purchase_order_against(bo, qty=10)
+		po.items[0].blanket_order_rate = 999
+		po.items[0].rate = 150
+		po.insert()
+
+		self.assertEqual(po.items[0].blanket_order_rate, 100)
+		self.assertIn("differs from the rate", str(frappe.message_log[-1]))
+
+	def test_party_and_order_type_are_enforced(self):
+		bo = new_blanket_order(blanket_order_type="Selling")
+		bo.customer = None
+		bo.supplier = "_Test Supplier"
+		bo.append("items", {"item_code": "_Test Item", "qty": 10, "rate": 100})
+		self.assertRaises(frappe.MandatoryError, bo.insert)
+
+		bo.customer = "_Test Customer"
+		bo.insert()
+		self.assertIsNone(bo.supplier)
+		bo.submit()
+
+		frappe.flags.args.doctype = "Purchase Order"
+		self.assertRaisesRegex(frappe.ValidationError, "cannot be made from", make_order, bo.name)
+
+		untyped = new_blanket_order(blanket_order_type="Selling")
+		untyped.blanket_order_type = None
+		untyped.append("items", {"item_code": "_Test Item", "qty": 10, "rate": 100})
+		self.assertRaises(frappe.MandatoryError, untyped.insert)
+
+	@AXERPTestSuite.change_settings(
+		"Buying Settings", {"blanket_order_allowance": 0, "allow_multiple_items": 1}
+	)
+	def test_update_items_counts_the_qty_of_deleted_rows(self):
+		bo = make_blanket_order(blanket_order_type="Purchasing", quantity=100)
+		po = make_purchase_order_against(bo, qty=80)
+		po.append("items", {**po.items[0].as_dict(), "name": None, "idx": None, "qty": 20})
+		po.submit()
+
+		update_purchase_order_row_qty(po, po.items[0], 100)
+
+		self.assertEqual(frappe.db.get_value("Purchase Order Item", po.items[0].name, "qty"), 100)
+		self.assertFalse(frappe.db.exists("Purchase Order Item", po.items[1].name))
+
+	def test_update_items_refreshes_blanket_order_of_removed_row(self):
+		bo = make_blanket_order(blanket_order_type="Purchasing", quantity=100)
+		po = make_purchase_order_against(bo, qty=10)
+		second_item = make_item("_Test Blanket Order Second Item", {"is_stock_item": 1}).name
+		po.append(
+			"items",
+			{
+				"item_code": second_item,
+				"qty": 5,
+				"rate": 100,
+				"warehouse": po.items[0].warehouse,
+				"schedule_date": today(),
+			},
+		)
+		po.submit()
+		self.assertEqual(frappe.db.get_value("Blanket Order Item", {"parent": bo.name}, "ordered_qty"), 10)
+
+		# Keep only the row without a blanket order
+		update_purchase_order_row_qty(po, po.items[1], 5)
+
+		self.assertEqual(frappe.db.get_value("Blanket Order Item", {"parent": bo.name}, "ordered_qty"), 0)
+
+	def test_update_items_cannot_raise_qty_past_blanket_order(self):
+		bo = make_blanket_order(blanket_order_type="Purchasing", quantity=100)
+		po = make_purchase_order_against(bo, qty=50)
+		po.submit()
+		row = po.items[0]
+
+		self.assertRaises(frappe.ValidationError, update_purchase_order_row_qty, po, row, 250)
+		self.assertEqual(frappe.db.get_value("Purchase Order Item", row.name, "qty"), 50)
+
+		update_purchase_order_row_qty(po, row, 100)
+		self.assertEqual(frappe.db.get_value("Blanket Order Item", bo.items[0].name, "ordered_qty"), 100)
+
+	def test_blanket_order_lookup_skips_fully_ordered_order(self):
+		item = make_item("_Test Blanket Order Lookup Item", {"is_stock_item": 1}).name
+		used_up = make_blanket_order(blanket_order_type="Purchasing", quantity=10, rate=100, item_code=item)
+		po = make_purchase_order_against(used_up, qty=10)
+		po.items[0].warehouse = "_Test Warehouse - _TC"
+		po.submit()
+		open_order = make_blanket_order(
+			blanket_order_type="Purchasing", quantity=100, rate=90, item_code=item
+		)
+
+		details = get_blanket_order_details(
+			{
+				"company": "_Test Company",
+				"currency": open_order.currency,
+				"supplier": open_order.supplier,
+				"doctype": "Purchase Order",
+				"item_code": item,
+				"transaction_date": today(),
+			}
+		)
+		self.assertEqual(details.blanket_order, open_order.name)
+		self.assertEqual(details.blanket_order_rate, 90)
+
 
 def make_blanket_order(**args):
 	args = frappe._dict(args)
-	bo = frappe.new_doc("Blanket Order")
-	bo.blanket_order_type = args.blanket_order_type
-	bo.company = args.company or "_Test Company"
-
-	if args.blanket_order_type == "Selling":
-		bo.customer = args.customer or "_Test Customer"
-	else:
-		bo.supplier = args.supplier or "_Test Supplier"
-
-	bo.from_date = today()
-	bo.to_date = add_months(bo.from_date, months=12)
-
+	bo = new_blanket_order(
+		blanket_order_type=args.blanket_order_type,
+		company=args.company or "_Test Company",
+		currency=args.currency,
+		conversion_rate=args.conversion_rate or 1,
+		customer=args.customer,
+		supplier=args.supplier,
+	)
 	bo.append(
 		"items",
 		{
@@ -140,3 +688,148 @@ def make_blanket_order(**args):
 	bo.insert()
 	bo.submit()
 	return bo
+
+
+def make_party_reader(email, party_role, party_type, party):
+	from erpnext.tests.permission_test_utils import make_fenced_user
+
+	user = make_fenced_user(email, ["System Manager", party_role])
+	frappe.get_doc(
+		{
+			"doctype": "User Permission",
+			"user": user,
+			"allow": party_type,
+			"for_value": party,
+			"apply_to_all_doctypes": 0,
+			"applicable_for": party_type,
+		}
+	).insert(ignore_permissions=True)
+	frappe.clear_cache(user=user)
+	return user
+
+
+def make_priced_blanket_order(
+	blanket_order_type="Selling",
+	company="_Test Company",
+	currency=None,
+	conversion_rate=1,
+	price_list_rate=800,
+	qty=1,
+):
+	price_list = make_blanket_order_price_list(get_company_currency(company), price_list_rate)
+	blanket_order = new_blanket_order(
+		blanket_order_type=blanket_order_type,
+		company=company,
+		currency=currency,
+		conversion_rate=conversion_rate,
+	)
+	config = blanket_order_pricing.get_order_type_config(blanket_order_type)
+	blanket_order.set(config["price_list_field"], price_list)
+	item = blanket_order.append("items", {"item_code": "_Test Item", "qty": qty, "rate": 0})
+	pricing = apply_price_list(blanket_order.as_dict())
+	blanket_order.update(pricing["parent"])
+	item.update({key: value for key, value in pricing["children"][0].items() if key != "name"})
+
+	return blanket_order, price_list
+
+
+def new_blanket_order(
+	blanket_order_type,
+	company="_Test Company",
+	currency=None,
+	conversion_rate=1,
+	customer=None,
+	supplier=None,
+):
+	blanket_order = frappe.new_doc("Blanket Order")
+	blanket_order.blanket_order_type = blanket_order_type
+	blanket_order.company = company
+	blanket_order.currency = currency or get_company_currency(company)
+	blanket_order.conversion_rate = conversion_rate
+	blanket_order.from_date = today()
+	blanket_order.to_date = add_months(blanket_order.from_date, months=12)
+
+	config = blanket_order_pricing.get_order_type_config(blanket_order_type)
+	party = customer if config["party_field"] == "customer" else supplier
+	blanket_order.set(config["party_field"], party or f"_Test {config['party_type']}")
+
+	return blanket_order
+
+
+def make_blanket_order_price_list(currency, price_list_rate):
+	price_list = "_Test Blanket Order Price List"
+	if not frappe.db.exists("Price List", price_list):
+		frappe.get_doc(
+			{
+				"doctype": "Price List",
+				"price_list_name": price_list,
+				"currency": currency,
+				"selling": 1,
+				"buying": 1,
+			}
+		).insert()
+	else:
+		frappe.db.set_value("Price List", price_list, {"currency": currency, "selling": 1, "buying": 1})
+
+	item_price = frappe.db.get_value(
+		"Item Price", {"price_list": price_list, "item_code": "_Test Item"}, "name"
+	)
+	if item_price:
+		frappe.db.set_value("Item Price", item_price, "price_list_rate", price_list_rate)
+	else:
+		frappe.get_doc(
+			{
+				"doctype": "Item Price",
+				"price_list": price_list,
+				"item_code": "_Test Item",
+				"price_list_rate": price_list_rate,
+			}
+		).insert()
+
+	return price_list
+
+
+def make_purchase_order_against(blanket_order, qty):
+	frappe.flags.args.doctype = "Purchase Order"
+	po = make_order(blanket_order.name)
+	po.currency = get_company_currency(po.company)
+	po.schedule_date = today()
+	po.items[0].qty = qty
+	return po
+
+
+def receive_purchase_order(po, qty):
+	from erpnext.buying.doctype.purchase_order.purchase_order import make_purchase_receipt
+
+	receipt = make_purchase_receipt(po.name)
+	receipt.items[0].qty = qty
+	receipt.submit()
+	return receipt
+
+
+def blanket_order_ordered_qty(bo):
+	return frappe.db.get_value("Blanket Order Item", bo.items[0].name, "ordered_qty")
+
+
+def make_box_item(item_code):
+	return make_item(
+		item_code,
+		{
+			"is_stock_item": 1,
+			"stock_uom": "Nos",
+			"uoms": [{"uom": "Nos", "conversion_factor": 1}, {"uom": "Box", "conversion_factor": 12}],
+		},
+	).name
+
+
+def update_purchase_order_row_qty(po, row, qty):
+	payload = {
+		"docname": row.name,
+		"item_code": row.item_code,
+		"qty": qty,
+		"rate": row.rate,
+		"uom": row.uom,
+		"conversion_factor": row.conversion_factor,
+		"schedule_date": str(row.schedule_date),
+	}
+	update_child_qty_rate("Purchase Order", json.dumps([payload]), po.name)

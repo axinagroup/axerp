@@ -62,6 +62,7 @@ class AccountsSettings(Document):
 		book_asset_depreciation_entry_automatically: DF.Check
 		book_deferred_entries_based_on: DF.Literal["Days", "Months"]
 		book_deferred_entries_via_journal_entry: DF.Check
+		book_stock_expense_gl_entries: DF.Check
 		book_tax_discount_loss: DF.Check
 		calculate_depr_using_total_days: DF.Check
 		check_supplier_invoice_uniqueness: DF.Check
@@ -71,12 +72,14 @@ class AccountsSettings(Document):
 		default_ageing_range: DF.Data | None
 		delete_linked_ledger_entries: DF.Check
 		determine_address_tax_category_from: DF.Literal["Billing Address", "Shipping Address"]
+		disable_include_dimensions: DF.Check
 		enable_accounting_dimensions: DF.Check
 		enable_common_party_accounting: DF.Check
 		enable_discounts_and_margin: DF.Check
 		enable_fuzzy_matching: DF.Check
 		enable_immutable_ledger: DF.Check
 		enable_loyalty_point_program: DF.Check
+		enable_overdue_billing_threshold: DF.Check
 		enable_party_matching: DF.Check
 		enable_subscription: DF.Check
 		exchange_gain_loss_posting_date: DF.Literal["Invoice", "Payment", "Reconciliation Date"]
@@ -95,6 +98,7 @@ class AccountsSettings(Document):
 		receivable_payable_remarks_length: DF.Int
 		reconciliation_queue_size: DF.Int
 		repost_allowed_types: DF.Table[RepostAllowedTypes]
+		role_allowed_to_bypass_overdue_billing: DF.Link | None
 		role_allowed_to_over_bill: DF.Link | None
 		role_to_notify_on_depreciation_failure: DF.Link | None
 		role_to_override_stop_action: DF.Link | None
@@ -150,6 +154,10 @@ class AccountsSettings(Document):
 			toggle_subscription_sections(not self.enable_subscription)
 			clear_cache = True
 
+		if old_doc.enable_overdue_billing_threshold != self.enable_overdue_billing_threshold:
+			toggle_overdue_billing_threshold_field(not self.enable_overdue_billing_threshold)
+			clear_cache = True
+
 		if clear_cache:
 			frappe.clear_cache()
 
@@ -178,14 +186,12 @@ class AccountsSettings(Document):
 			)
 
 	def validate_and_sync_auto_reconcile_config(self):
-		if self.has_value_changed("auto_reconciliation_job_trigger"):
-			if (
-				cint(self.auto_reconciliation_job_trigger) > 0
-				and cint(self.auto_reconciliation_job_trigger) < 60
-			):
-				sync_auto_reconcile_config(self.auto_reconciliation_job_trigger)
-			else:
-				frappe.throw(_("Cron Interval should be between 1 and 59 Min"))
+		interval_changed = self.has_value_changed("auto_reconciliation_job_trigger")
+		if interval_changed and not 0 < cint(self.auto_reconciliation_job_trigger) < 60:
+			frappe.throw(_("Cron Interval should be between 1 and 59 Min"))
+
+		if self.auto_reconcile_payments:
+			sync_auto_reconcile_config(self.auto_reconciliation_job_trigger)
 
 		if self.has_value_changed("reconciliation_queue_size"):
 			if cint(self.reconciliation_queue_size) < 5 or cint(self.reconciliation_queue_size) > 100:
@@ -211,6 +217,13 @@ class AccountsSettings(Document):
 		doctypes += get_child_docs(doctypes)
 
 		set_allow_on_submit_for_dimension_fields(doctypes)
+
+
+@frappe.whitelist(methods=["POST"])
+def get_posting_date_confirmation() -> int:
+	return cint(
+		frappe.db.get_single_value("Accounts Settings", "confirm_before_resetting_posting_date", cache=False)
+	)
 
 
 def toggle_accounting_dimension_sections(hide):
@@ -239,6 +252,10 @@ def toggle_subscription_sections(hide):
 	subscription_doctypes = frappe.get_hooks("subscription_doctypes")
 	for doctype in subscription_doctypes:
 		create_property_setter_for_hiding_field(doctype, "subscription_section", hide)
+
+
+def toggle_overdue_billing_threshold_field(hide):
+	create_property_setter_for_hiding_field("Customer Credit Limit", "overdue_billing_threshold", hide)
 
 
 def create_property_setter_for_hiding_field(doctype, field_name, hide):

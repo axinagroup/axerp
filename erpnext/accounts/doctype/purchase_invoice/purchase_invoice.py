@@ -8,7 +8,7 @@ import frappe
 from frappe import _, qb, throw
 from frappe.model.mapper import get_mapped_doc
 from frappe.query_builder.functions import Sum
-from frappe.utils import cint, cstr, flt, formatdate, get_link_to_form, getdate, nowdate
+from frappe.utils import DateTimeLikeObject, cint, cstr, flt, formatdate, get_link_to_form, getdate, nowdate
 
 import erpnext
 from erpnext.accounts.deferred_revenue import validate_service_stop_date
@@ -41,9 +41,23 @@ from erpnext.accounts.utils import (
 from erpnext.assets.doctype.asset.asset import is_cwip_accounting_enabled
 from erpnext.assets.doctype.asset_category.asset_category import get_asset_category_account
 from erpnext.controllers.accounts_controller import merge_taxes, validate_account_head
-from erpnext.controllers.buying_controller import BuyingController
+from erpnext.controllers.buying_controller import (
+	BuyingController,
+	get_received_stock_qty_status_args,
+	get_stock_qty,
+	get_transit_amount,
+)
+from erpnext.controllers.mapper import get_qty_already_mapped
+from erpnext.projects.doctype.project.project import update_purchase_cost
 from erpnext.stock.doctype.purchase_receipt.purchase_receipt import (
+	get_billed_amount_against_po,
+	get_billed_amount_against_pr,
+	get_purchase_receipts_against_po_details,
+	set_qty_and_amount_net_of_returns,
 	update_billed_amount_based_on_po,
+)
+from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
+	cancel_stock_reservation_entries,
 )
 
 
@@ -240,6 +254,9 @@ class PurchaseInvoice(BuyingController):
 				"source_field": "amount",
 				"percent_join_field": "purchase_order",
 				"overflow_type": "billing",
+				"billing_flag": "update_billed_amount_in_purchase_order",
+				"extra_cond": """ and exists(select name from `tabPurchase Invoice`
+				where name=`tabPurchase Invoice Item`.parent and (is_return=0 or update_billed_amount_in_purchase_order=1))""",
 			}
 		]
 
@@ -286,9 +303,8 @@ class PurchaseInvoice(BuyingController):
 		self.check_conversion_rate()
 		self.validate_credit_to_acc()
 		self.clear_unallocated_advances("Purchase Invoice Advance", "advances")
-		self.check_for_on_hold_or_closed_status(
-			"Purchase Order", "purchase_order", exclude_if_field="purchase_receipt"
-		)
+		self.check_purchase_order_on_hold_or_close("purchase_order", exclude_if_field="purchase_receipt")
+		self.validate_closed_purchase_receipts()
 		self.validate_with_previous_doc()
 		self.validate_uom_is_integer("uom", "qty")
 		self.validate_uom_is_integer("stock_uom", "stock_qty")
@@ -300,6 +316,7 @@ class PurchaseInvoice(BuyingController):
 		self.validate_multiple_billing("Purchase Receipt", "pr_detail", "amount")
 		self.set_status()
 		self.validate_purchase_receipt_if_update_stock()
+		self.validate_exchange_rate_with_purchase_receipt()
 		validate_inter_company_party(
 			self.doctype, self.supplier, self.company, self.inter_company_invoice_reference
 		)
@@ -308,6 +325,9 @@ class PurchaseInvoice(BuyingController):
 		self.reset_default_field_value("set_from_warehouse", "items", "from_warehouse")
 		PurchaseTaxWithholding(self).on_validate()
 		self.set_percentage_received()
+
+		if self.on_hold:
+			self.validate_invoice_hold()
 
 	def set_percentage_received(self):
 		total_billed_qty = 0.0
@@ -319,6 +339,134 @@ class PurchaseInvoice(BuyingController):
 
 		if total_billed_qty and total_received_qty:
 			self.per_received = total_received_qty / total_billed_qty * 100
+
+	def validate_exchange_rate_with_purchase_receipt(self):
+		if self.is_internal_transfer() or not erpnext.is_perpetual_inventory_enabled(self.company):
+			return
+
+		if frappe.db.get_single_value("Buying Settings", "set_landed_cost_based_on_purchase_invoice_rate"):
+			return
+
+		stock_items = self.get_stock_items()
+		receipts = {
+			item.purchase_receipt
+			for item in self.items
+			if item.purchase_receipt and item.item_code in stock_items
+		}
+		receipts.update(self.get_receipts_billed_through_order(stock_items))
+		if not receipts:
+			return
+
+		mismatched = [
+			f"{frappe.bold(row.name)} ({row.conversion_rate})"
+			for row in frappe.get_all(
+				"Purchase Receipt",
+				filters={"name": ("in", list(receipts))},
+				fields=["name", "currency", "conversion_rate"],
+			)
+			if row.currency == self.currency
+			and flt(row.conversion_rate)
+			and flt(row.conversion_rate) != flt(self.conversion_rate)
+		]
+		if not mismatched:
+			return
+
+		frappe.throw(
+			_(
+				"Exchange rate {0} does not match the exchange rate of Purchase Receipt {1}. Use the same exchange rate as the Purchase Receipt or enable {2} in {3} to adjust the landed cost based on this invoice."
+			).format(
+				frappe.bold(self.conversion_rate),
+				", ".join(mismatched),
+				frappe.bold(_("Set Landed Cost Based on Purchase Invoice Rate")),
+				get_link_to_form("Buying Settings", "Buying Settings", _("Buying Settings")),
+			)
+		)
+
+	def get_receipts_billed_through_order(self, stock_items):
+		if self.update_stock or self.is_return:
+			return set()
+
+		po_details = list(
+			{
+				item.po_detail
+				for item in self.items
+				if item.po_detail and not item.pr_detail and item.item_code in stock_items
+			}
+		)
+		if not po_details:
+			return set()
+
+		pr_items = get_purchase_receipts_against_po_details(po_details)
+		if not pr_items:
+			return set()
+
+		po_billed_amounts = get_billed_amount_against_po(po_details)
+		pr_billed_amounts = get_billed_amount_against_pr([item.name for item in pr_items])
+		for item in self.items:
+			if item.pr_detail:
+				pr_billed_amounts[item.pr_detail] = pr_billed_amounts.get(item.pr_detail, 0) + flt(
+					item.amount
+				)
+			elif item.po_detail in po_details:
+				billed = po_billed_amounts.setdefault(item.po_detail, {"billed_amt": 0, "billed_qty": 0})
+				billed["billed_amt"] += flt(item.amount)
+				billed["billed_qty"] += flt(item.qty)
+
+		set_qty_and_amount_net_of_returns(pr_items)
+		receipts_to_validate = set()
+		for pr_item in pr_items:
+			billed_details = po_billed_amounts.get(pr_item.purchase_order_item, {})
+			billed_amt_against_po = flt(billed_details.get("billed_amt"))
+			billed_qty_against_po = flt(billed_details.get("billed_qty"))
+			billed_amt_against_pr = flt(pr_billed_amounts.get(pr_item.name, 0))
+
+			if billed_amt_against_po and billed_amt_against_pr < pr_item.net_amount:
+				if (
+					not billed_amt_against_pr
+					and billed_qty_against_po
+					and billed_qty_against_po > pr_item.net_qty
+				):
+					billed_amt_against_pr = (
+						billed_amt_against_po * flt(pr_item.net_qty) / billed_qty_against_po
+					)
+					po_billed_amounts[pr_item.purchase_order_item]["billed_amt"] -= billed_amt_against_pr
+					po_billed_amounts[pr_item.purchase_order_item]["billed_qty"] -= pr_item.net_qty
+				else:
+					pending_to_bill = flt(pr_item.net_amount) - billed_amt_against_pr
+					consumed_amt = min(pending_to_bill, billed_amt_against_po)
+					billed_amt_against_pr += consumed_amt
+					po_billed_amounts[pr_item.purchase_order_item]["billed_amt"] -= consumed_amt
+					po_billed_amounts[pr_item.purchase_order_item]["billed_qty"] *= (
+						1 - consumed_amt / billed_amt_against_po
+					)
+
+			if flt(billed_amt_against_pr - flt(pr_item.billed_amt), self.precision("amount", "items")) > 0:
+				receipts_to_validate.add(pr_item.parent)
+
+		return receipts_to_validate
+
+	def validate_invoice_hold(self):
+		if self.is_return:
+			frappe.throw(_("Return Purchase Invoice cannot be held."))
+
+		if self.docstatus < 1:
+			frappe.throw(_("Purchase Invoice can be held after submitting."))
+
+	def validate_closed_purchase_receipts(self):
+		purchase_receipts = {d.purchase_receipt for d in self.items if d.purchase_receipt}
+		if self.is_return or not purchase_receipts:
+			return
+
+		if closed := frappe.get_all(
+			"Purchase Receipt",
+			filters={"name": ("in", list(purchase_receipts)), "status": "Closed"},
+			pluck="name",
+		):
+			frappe.throw(
+				_("Purchase Receipt {0} is closed and cannot be invoiced").format(
+					", ".join(frappe.bold(name) for name in closed)
+				)
+			)
 
 	def validate_release_date(self):
 		if self.release_date and getdate(nowdate()) >= getdate(self.release_date):
@@ -634,7 +782,7 @@ class PurchaseInvoice(BuyingController):
 					throw(msg, title=_("Mandatory Purchase Order"))
 
 	def pr_required(self):
-		if frappe.db.get_single_value("Buying Settings", "pr_required") == "Yes":
+		if frappe.db.get_single_value("Buying Settings", "pr_required") == "Yes" and not self.update_stock:
 			stock_and_asset_items = self.get_stock_items()
 			stock_and_asset_items.extend(self.get_asset_items())
 			if frappe.get_value(
@@ -707,9 +855,10 @@ class PurchaseInvoice(BuyingController):
 					"target_parent_dt": "Purchase Order",
 					"target_parent_field": "per_received",
 					"target_ref_field": "qty",
-					"source_field": "received_qty",
+					"source_field": "received_qty * conversion_factor",
+					"target_conversion_factor": "conversion_factor",
 					"second_source_dt": "Purchase Receipt Item",
-					"second_source_field": "received_qty",
+					"second_source_field": "received_qty * conversion_factor",
 					"second_join_field": "purchase_order_item",
 					"percent_join_field": "purchase_order",
 					"overflow_type": "receipt",
@@ -726,8 +875,14 @@ class PurchaseInvoice(BuyingController):
 					"target_parent_dt": "Material Request",
 					"target_parent_field": "per_received",
 					"target_ref_field": "stock_qty",
-					"source_field": "stock_qty",
+					**get_received_stock_qty_status_args(),
+					"second_source_dt": "Purchase Receipt Item",
+					"second_source_field": "qty * conversion_factor",
+					"second_join_field": "material_request_item",
+					"extra_cond": """ and exists(select name from `tabPurchase Invoice`
+					where name=`tabPurchase Invoice Item`.parent and update_stock = 1)""",
 					"percent_join_field": "material_request",
+					"validate_qty": False,
 				}
 			)
 			if cint(self.is_return):
@@ -737,13 +892,16 @@ class PurchaseInvoice(BuyingController):
 						"target_dt": "Purchase Order Item",
 						"join_field": "po_detail",
 						"target_field": "returned_qty",
-						"source_field": "-1 * qty",
+						"source_field": "-1 * qty * conversion_factor",
+						"target_conversion_factor": "conversion_factor",
 						"second_source_dt": "Purchase Receipt Item",
-						"second_source_field": "-1 * qty",
+						"second_source_field": "-1 * qty * conversion_factor",
 						"second_join_field": "purchase_order_item",
 						"overflow_type": "receipt",
 						"extra_cond": """ and exists (select name from `tabPurchase Invoice`
 						where name=`tabPurchase Invoice Item`.parent and update_stock=1 and is_return=1)""",
+						"second_source_extra_cond": """ and exists (select name from `tabPurchase Receipt`
+						where name=`tabPurchase Receipt Item`.parent and is_return=1)""",
 					}
 				)
 
@@ -815,6 +973,9 @@ class PurchaseInvoice(BuyingController):
 
 		self.process_common_party_accounting()
 
+		if self.is_return and self.return_against:
+			frappe.get_doc(self.doctype, self.return_against).set_status(update=True)
+
 	def on_update_after_submit(self):
 		fields_to_check = [
 			"cash_bank_account",
@@ -823,8 +984,8 @@ class PurchaseInvoice(BuyingController):
 			"is_opening",
 		]
 		child_tables = {"items": ("expense_account",), "taxes": ("account_head",)}
-		self.needs_repost = self.check_if_fields_updated(fields_to_check, child_tables)
-		if self.needs_repost:
+		needs_repost = self.check_if_fields_updated(fields_to_check, child_tables)
+		if needs_repost:
 			self.validate_for_repost()
 			self.repost_accounting_entries()
 
@@ -835,6 +996,7 @@ class PurchaseInvoice(BuyingController):
 	def make_gl_entries(self, gl_entries=None, from_repost=False):
 		update_outstanding = "No" if (cint(self.is_paid) or self.write_off_account) else "Yes"
 		if self.docstatus == 1:
+			self.cancel_provisional_entries()
 			if not gl_entries:
 				gl_entries = self.get_gl_entries()
 
@@ -973,6 +1135,10 @@ class PurchaseInvoice(BuyingController):
 		gl_entries.append(self.get_gl_dict(gl, self.party_account_currency, item=self))
 
 	def make_item_gl_entries(self, gl_entries):
+		from erpnext.stock.doctype.landed_cost_voucher.landed_cost_voucher import (
+			get_custom_dimension_overrides,
+		)
+
 		# item gl entries
 		stock_items = self.get_stock_items()
 		if self.update_stock and self.auto_accounting_for_stock:
@@ -1014,7 +1180,10 @@ class PurchaseInvoice(BuyingController):
 		)
 
 		for item in self.get("items"):
-			if flt(item.base_net_amount) or (self.get("update_stock") and item.valuation_rate):
+			if flt(item.base_net_amount) or (
+				self.get("update_stock")
+				and (item.valuation_rate or voucher_wise_stock_value.get((item.name, item.warehouse)))
+			):
 				if item.item_code:
 					frappe.get_cached_value("Item", item.item_code, "asset_category")
 
@@ -1052,9 +1221,15 @@ class PurchaseInvoice(BuyingController):
 							)
 						)
 
-						credit_amount = item.base_net_amount
-						if self.is_internal_supplier and item.valuation_rate:
-							credit_amount = flt(item.valuation_rate * item.stock_qty)
+						rejected_amount = self.make_rejected_warehouse_gl_entry(
+							gl_entries, item, voucher_wise_stock_value, inventory_account_map
+						)
+						credit_amount = self.get_transit_stock_value(item, voucher_wise_stock_value)
+						if credit_amount is None:
+							credit_amount = item.base_net_amount
+							if self.is_internal_supplier and item.valuation_rate:
+								credit_amount = flt(item.valuation_rate * item.stock_qty)
+							credit_amount += rejected_amount
 
 						# Intentionally passed negative debit amount to avoid incorrect GL Entry validation
 						gl_entries.append(
@@ -1092,6 +1267,10 @@ class PurchaseInvoice(BuyingController):
 							)
 
 					else:
+						self.make_rejected_warehouse_gl_entry(
+							gl_entries, item, voucher_wise_stock_value, inventory_account_map
+						)
+
 						if not self.is_internal_transfer():
 							gl_entries.append(
 								self.get_gl_dict(
@@ -1114,25 +1293,34 @@ class PurchaseInvoice(BuyingController):
 
 					# Amount added through landed-cost-voucher
 					if landed_cost_entries:
-						if (item.item_code, item.name) in landed_cost_entries:
-							for account, base_amount in landed_cost_entries[
-								(item.item_code, item.name)
-							].items():
-								gl_entries.append(
-									self.get_gl_dict(
-										{
-											"account": account,
-											"against": item.expense_account,
-											"cost_center": item.cost_center,
-											"remarks": self.get("remarks") or _("Accounting Entry for Stock"),
-											"credit": flt(base_amount["base_amount"]),
-											"credit_in_account_currency": flt(base_amount["amount"]),
-											"credit_in_transaction_currency": item.net_amount,
-											"project": item.project or self.project,
-										},
-										item=item,
-									)
+						for entry in landed_cost_entries.get((item.item_code, item.name), []):
+							if not (entry.amount or entry.base_amount):
+								continue
+
+							lcv_account_currency = get_account_currency(entry.expense_account)
+							credit_in_transaction_currency = (
+								flt(entry.amount)
+								if lcv_account_currency == self.currency
+								else flt(
+									entry.base_amount / self.conversion_rate, item.precision("net_amount")
 								)
+							)
+
+							gl_dict = self.get_gl_dict(
+								{
+									"account": entry.expense_account,
+									"against": item.expense_account,
+									"cost_center": entry.dimensions.cost_center or item.cost_center,
+									"remarks": self.get("remarks") or _("Accounting Entry for Stock"),
+									"credit": flt(entry.base_amount),
+									"credit_in_account_currency": flt(entry.amount),
+									"credit_in_transaction_currency": credit_in_transaction_currency,
+									"project": entry.dimensions.project or item.project or self.project,
+								},
+								item=item,
+							)
+							gl_dict.update(get_custom_dimension_overrides(entry))
+							gl_entries.append(gl_dict)
 
 					# sub-contracting warehouse
 					if flt(item.rm_supp_cost):
@@ -1280,7 +1468,12 @@ class PurchaseInvoice(BuyingController):
 				self.update_net_purchase_amount_for_linked_assets(item)
 
 	def get_provisional_accounts(self):
+		from erpnext.stock.doctype.purchase_receipt.purchase_receipt import (
+			get_order_billing_provisional_reversals,
+		)
+
 		self.provisional_accounts = frappe._dict()
+		self.order_provisional_reversals = get_order_billing_provisional_reversals(self)
 		linked_purchase_receipts = set([d.purchase_receipt for d in self.items if d.purchase_receipt])
 		if not linked_purchase_receipts:
 			return
@@ -1321,23 +1514,37 @@ class PurchaseInvoice(BuyingController):
 			}
 
 	def make_provisional_gl_entry(self, gl_entries, item):
+		from erpnext.stock.doctype.purchase_receipt.purchase_receipt import post_provisional_gl_entry
+
 		if item.purchase_receipt:
 			pr_item = self.provisional_accounts.get(item.pr_detail, {})
 			if pr_item.get("has_provisional_entry"):
-				purchase_receipt_doc = frappe.get_cached_doc("Purchase Receipt", item.purchase_receipt)
+				conversion_rate = frappe.get_cached_value(
+					"Purchase Receipt", item.purchase_receipt, "conversion_rate"
+				)
 
-				# Intentionally passing purchase invoice item to handle partial billing
-				purchase_receipt_doc.add_provisional_gl_entry(
+				post_provisional_gl_entry(
+					self,
 					item,
 					gl_entries,
 					self.posting_date,
 					pr_item.get("provisional_account"),
 					reverse=1,
-					item_amount=(
-						(min(item.qty, pr_item.get("qty")) * pr_item.get("rate"))
-						* purchase_receipt_doc.get("conversion_rate")
-					),
+					item_amount=(min(item.qty, pr_item.get("qty")) * pr_item.get("rate")) * conversion_rate,
 				)
+			return
+
+		for row, qty in self.order_provisional_reversals.get(item.name, []):
+			post_provisional_gl_entry(
+				self,
+				item,
+				gl_entries,
+				self.posting_date,
+				row.provisional_expense_account,
+				reverse=1,
+				item_amount=qty * flt(row.rate) * flt(row.conversion_rate),
+				pr_detail=row.name,
+			)
 
 	def update_net_purchase_amount_for_linked_assets(self, item):
 		assets = frappe.db.get_all(
@@ -1350,7 +1557,9 @@ class PurchaseInvoice(BuyingController):
 			fields=["name", "asset_quantity"],
 		)
 		for asset in assets:
-			purchase_amount = flt(item.valuation_rate) * asset.asset_quantity
+			purchase_amount = (
+				flt(item.valuation_rate) * flt(item.conversion_factor or 1) * asset.asset_quantity
+			)
 			frappe.db.set_value(
 				"Asset",
 				asset.name,
@@ -1360,28 +1569,121 @@ class PurchaseInvoice(BuyingController):
 				},
 			)
 
+	def make_rejected_warehouse_gl_entry(
+		self, gl_entries, item, voucher_wise_stock_value, inventory_account_map
+	) -> float:
+		"""Book the material the invoice moved into the rejected warehouse.
+
+		An internal transfer carries the value credited out of the in-transit warehouse along with
+		the accepted material, so the entry against it is that warehouse, and the caller credits it
+		for both. On an ordinary invoice the supplier entry already holds the cost.
+		"""
+		if not (item.rejected_warehouse and flt(item.rejected_qty)):
+			return 0.0
+
+		transfers_rejected_material = self.is_internal_transfer()
+
+		rejected_amount = flt(
+			voucher_wise_stock_value.get((item.name, item.rejected_warehouse)),
+			item.precision("base_net_amount"),
+		)
+		if not rejected_amount:
+			return 0.0
+
+		rejected_account = self.get_inventory_account_dict(item, inventory_account_map, "rejected_warehouse")
+		gl_entries.append(
+			self.get_gl_dict(
+				{
+					"account": rejected_account["account"],
+					"against": item.expense_account if transfers_rejected_material else self.supplier,
+					"cost_center": item.cost_center,
+					"project": item.project or self.project,
+					"remarks": self.get("remarks") or _("Accounting Entry for Stock"),
+					"debit": rejected_amount,
+					"debit_in_transaction_currency": flt(
+						rejected_amount / self.conversion_rate, item.precision("net_amount")
+					),
+				},
+				rejected_account["account_currency"],
+				item=item,
+			)
+		)
+
+		return rejected_amount if transfers_rejected_material else 0.0
+
+	def get_transit_stock_value(self, item, voucher_wise_stock_value) -> float | None:
+		"""Stock value an internal transfer took out of the in-transit warehouse, negative for a return.
+
+		None when the rejected material stays in transit, as its stock value cannot be told apart then.
+		"""
+		if not (item.from_warehouse and self.is_internal_transfer()):
+			return None
+
+		if item.rejected_warehouse == item.from_warehouse:
+			return None
+
+		stock_value = voucher_wise_stock_value.get((item.name, item.from_warehouse))
+		return None if stock_value is None else -flt(stock_value)
+
 	def make_stock_adjustment_entry(self, gl_entries, item, voucher_wise_stock_value, account_currency):
 		net_amt_precision = item.precision("base_net_amount")
-		val_rate_db_precision = 6 if cint(item.precision("valuation_rate")) <= 6 else 9
 
 		warehouse_debit_amount = flt(
-			flt(item.valuation_rate, val_rate_db_precision) * flt(item.qty) * flt(item.conversion_factor),
+			flt(item.valuation_rate) * get_stock_qty(item, item.qty),
 			net_amt_precision,
 		)
 
-		if self.is_return and self.update_stock and (self.is_internal_supplier or not self.return_against):
+		transit_stock_value = self.get_transit_stock_value(item, voucher_wise_stock_value)
+		if transit_stock_value is not None:
+			# The accepted and rejected warehouses together take what left transit, plus the landed
+			# cost; round each part as it is posted so the entries balance.
+			rejected_stock_value = voucher_wise_stock_value.get((item.name, item.rejected_warehouse))
+			warehouse_debit_amount = flt(
+				flt(transit_stock_value, net_amt_precision)
+				- flt(rejected_stock_value, net_amt_precision)
+				+ flt(item.landed_cost_voucher_amount),
+				net_amt_precision,
+			)
+
+		if (
+			transit_stock_value is None
+			and self.is_return
+			and self.update_stock
+			and (self.is_internal_supplier or not self.return_against)
+		):
 			net_rate = item.base_net_amount
-			if item.sales_incoming_rate:  # for internal transfer
-				net_rate = item.qty * item.sales_incoming_rate
+			if item.sales_incoming_rate:
+				# Material of a transfer goes back at the rate it came in with, the rejected
+				# material along with the accepted.
+				net_rate = get_transit_amount(item, item.qty) + get_transit_amount(item, item.rejected_qty)
 
 			stock_amount = net_rate + item.item_tax_amount + flt(item.landed_cost_voucher_amount)
 			warehouse_debit_amount = flt(
 				voucher_wise_stock_value.get((item.name, item.warehouse)), net_amt_precision
 			)
 
-			if flt(stock_amount, net_amt_precision) != flt(warehouse_debit_amount, net_amt_precision):
-				cost_of_goods_sold_account = self.get_company_default("default_expense_account")
-				stock_adjustment_amt = stock_amount - warehouse_debit_amount
+			# The rejected warehouse carries the rest of what the invoice paid for, and is booked
+			# by its own entry, so it is not a variance.
+			returned_stock_value = warehouse_debit_amount + flt(
+				voucher_wise_stock_value.get((item.name, item.rejected_warehouse)), net_amt_precision
+			)
+
+			if flt(stock_amount, net_amt_precision) != flt(returned_stock_value, net_amt_precision):
+				stock_asset_rbnb = (
+					self.get_company_default("asset_received_but_not_billed", ignore_validation=True)
+					if item.is_fixed_asset
+					else self.get_company_default("stock_received_but_not_billed", ignore_validation=True)
+				)
+				fallback_account = (
+					(item.expense_account or stock_asset_rbnb)
+					if self.is_return
+					else (stock_asset_rbnb or item.expense_account)
+				)
+				cost_of_goods_sold_account = (
+					self.get_company_default("default_expense_account", ignore_validation=True)
+					or fallback_account
+				)
+				stock_adjustment_amt = stock_amount - returned_stock_value
 
 				gl_entries.append(
 					self.get_gl_dict(
@@ -1401,11 +1703,24 @@ class PurchaseInvoice(BuyingController):
 
 		elif (
 			self.update_stock
-			and voucher_wise_stock_value.get((item.name, item.warehouse))
+			and (transit_stock_value is not None or voucher_wise_stock_value.get((item.name, item.warehouse)))
 			and warehouse_debit_amount
 			!= flt(voucher_wise_stock_value.get((item.name, item.warehouse)), net_amt_precision)
 		):
-			cost_of_goods_sold_account = self.get_company_default("default_expense_account")
+			stock_asset_rbnb = (
+				self.get_company_default("asset_received_but_not_billed", ignore_validation=True)
+				if item.is_fixed_asset
+				else self.get_company_default("stock_received_but_not_billed", ignore_validation=True)
+			)
+			fallback_account = (
+				(item.expense_account or stock_asset_rbnb)
+				if self.is_return
+				else (stock_asset_rbnb or item.expense_account)
+			)
+			cost_of_goods_sold_account = (
+				self.get_company_default("default_expense_account", ignore_validation=True)
+				or fallback_account
+			)
 			stock_amount = flt(voucher_wise_stock_value.get((item.name, item.warehouse)), net_amt_precision)
 			stock_adjustment_amt = warehouse_debit_amount - stock_amount
 
@@ -1695,30 +2010,38 @@ class PurchaseInvoice(BuyingController):
 				else:
 					round_off_account = round_off_for_opening
 
+			round_off_account_currency = get_account_currency(round_off_account)
 			gl_entries.append(
 				self.get_gl_dict(
 					{
 						"account": round_off_account,
 						"against": self.supplier,
-						"debit_in_account_currency": self.rounding_adjustment,
+						"debit_in_transaction_currency": flt(
+							self.rounding_adjustment, self.precision("rounding_adjustment")
+						),
+						"debit_in_account_currency": self.base_rounding_adjustment
+						if round_off_account_currency == self.company_currency
+						else self.rounding_adjustment,
 						"debit": self.base_rounding_adjustment,
 						"cost_center": round_off_cost_center
 						if self.use_company_roundoff_cost_center
 						else (self.cost_center or round_off_cost_center),
 					},
+					round_off_account_currency,
 					item=self,
 				)
 			)
 
 	def on_cancel(self):
 		check_if_return_invoice_linked_with_payment_entry(self)
+		if self.is_return and self.is_internal_supplier:
+			# cancelling a return gives its qty back to the invoice it returned
+			self.validate_internal_transfer_qty()
 
 		super().on_cancel()
 		PurchaseTaxWithholding(self).on_cancel()
 
-		self.check_for_on_hold_or_closed_status(
-			"Purchase Order", "purchase_order", exclude_if_field="purchase_receipt"
-		)
+		self.check_purchase_order_on_hold_or_close("purchase_order", exclude_if_field="purchase_receipt")
 
 		if self.is_return and not self.update_billed_amount_in_purchase_order:
 			# NOTE status updating bypassed for is_return
@@ -1764,27 +2087,15 @@ class PurchaseInvoice(BuyingController):
 			"Unreconcile Payment Entries",
 			"Payment Ledger Entry",
 			"Serial and Batch Bundle",
+			"Quality Inspection",
 			"Tax Withholding Entry",
 		)
 
-	def update_project(self):
-		projects = frappe._dict()
-		for d in self.items:
-			if d.project:
-				if self.docstatus == 1:
-					projects[d.project] = projects.get(d.project, 0) + d.base_net_amount
-				elif self.docstatus == 2:
-					projects[d.project] = projects.get(d.project, 0) - d.base_net_amount
+		if self.is_return and self.return_against:
+			frappe.get_doc(self.doctype, self.return_against).set_status(update=True)
 
-		pj = frappe.qb.DocType("Project")
-		for proj, value in projects.items():
-			res = frappe.qb.from_(pj).select(pj.total_purchase_cost).where(pj.name == proj).for_update().run()
-			current_purchase_cost = res and res[0][0] or 0
-			# frappe.db.set_value("Project", proj, "total_purchase_cost", current_purchase_cost + value)
-			project_doc = frappe.get_lazy_doc("Project", proj)
-			project_doc.total_purchase_cost = current_purchase_cost + value
-			project_doc.calculate_gross_margin()
-			project_doc.db_update()
+	def update_project(self):
+		update_purchase_cost({d.project for d in self.items if d.project})
 
 	def validate_supplier_invoice(self):
 		if self.bill_no:
@@ -1873,16 +2184,42 @@ class PurchaseInvoice(BuyingController):
 		return pr_details_billed_amt
 
 	def on_recurring(self, reference_doc, auto_repeat_doc):
+		super().on_recurring(reference_doc, auto_repeat_doc)
 		self.due_date = None
+		self.shift_service_dates(reference_doc, auto_repeat_doc)
 
-	def block_invoice(self, hold_comment=None, release_date=None):
-		self.db_set("on_hold", 1)
-		self.db_set("hold_comment", cstr(hold_comment))
+	@frappe.whitelist(methods=["POST"])
+	def block_invoice(self, hold_comment: str | None = None, release_date: DateTimeLikeObject | None = None):
+		self.check_permission("write")
+		self.on_hold = 1
+		self.release_date = release_date
+		self.validate_block_invoice()
+
+		self.db_set({"on_hold": 1, "hold_comment": cstr(hold_comment), "release_date": release_date})
+
+	@frappe.whitelist(methods=["POST"])
+	def unblock_invoice(self):
+		self.check_permission("write")
+		self.db_set({"on_hold": 0, "release_date": None})
+
+	@frappe.whitelist(methods=["POST"])
+	def change_release_date(self, release_date: DateTimeLikeObject | None = None):
+		self.check_permission("write")
+
+		if not self.on_hold:
+			frappe.throw(_("Invoice is not blocked. Block the invoice to change the release date."))
+
+		self.release_date = release_date
+		self.validate_block_invoice()
+
 		self.db_set("release_date", release_date)
 
-	def unblock_invoice(self):
-		self.db_set("on_hold", 0)
-		self.db_set("release_date", None)
+	def validate_block_invoice(self):
+		self.validate_invoice_hold()
+		if self.outstanding_amount <= 0:
+			frappe.throw(_("Purchase Invoice without any outstanding amount cannot be held."))
+
+		self.validate_release_date()
 
 	def set_status(self, update=False, status=None, update_modified=True):
 		if self.is_new():
@@ -2008,28 +2345,6 @@ def make_stock_entry(source_name, target_doc=None):
 
 
 @frappe.whitelist()
-def change_release_date(name, release_date=None):
-	if frappe.db.exists("Purchase Invoice", name):
-		pi = frappe.get_lazy_doc("Purchase Invoice", name)
-		pi.check_permission()
-		pi.db_set("release_date", release_date)
-
-
-@frappe.whitelist()
-def unblock_invoice(name):
-	if frappe.db.exists("Purchase Invoice", name):
-		pi = frappe.get_lazy_doc("Purchase Invoice", name)
-		pi.unblock_invoice()
-
-
-@frappe.whitelist()
-def block_invoice(name, release_date, hold_comment=None):
-	if frappe.db.exists("Purchase Invoice", name):
-		pi = frappe.get_lazy_doc("Purchase Invoice", name)
-		pi.block_invoice(hold_comment, release_date)
-
-
-@frappe.whitelist()
 def make_inter_company_sales_invoice(source_name, target_doc=None):
 	from erpnext.accounts.doctype.sales_invoice.sales_invoice import make_inter_company_transaction
 
@@ -2042,6 +2357,11 @@ def make_purchase_receipt(source_name, target_doc=None, args=None):
 		args = {}
 	if isinstance(args, str):
 		args = json.loads(args)
+
+	mapped_qty_by_item = get_qty_already_mapped(target_doc, "purchase_invoice_item")
+
+	def received_and_mapped_qty(obj):
+		return flt(obj.received_qty) + flt(mapped_qty_by_item.get(obj.name, 0))
 
 	def post_parent_process(source_parent, target_parent):
 		remove_items_with_zero_qty(target_parent)
@@ -2066,15 +2386,13 @@ def make_purchase_receipt(source_name, target_doc=None, args=None):
 			or {}
 		)
 
-		target.qty = flt(obj.qty) - flt(obj.received_qty) - flt(returned_qty_map.get("qty"))
-		target.received_qty = flt(obj.qty) - flt(obj.received_qty)
-		target.stock_qty = (flt(obj.qty) - flt(obj.received_qty) - flt(returned_qty_map.get("qty"))) * flt(
-			obj.conversion_factor
-		)
-		target.amount = (flt(obj.qty) - flt(obj.received_qty)) * flt(obj.rate)
-		target.base_amount = (
-			(flt(obj.qty) - flt(obj.received_qty)) * flt(obj.rate) * flt(source_parent.conversion_rate)
-		)
+		pending_qty = flt(obj.qty) - received_and_mapped_qty(obj)
+
+		target.qty = pending_qty - flt(returned_qty_map.get("qty"))
+		target.received_qty = pending_qty
+		target.stock_qty = (pending_qty - flt(returned_qty_map.get("qty"))) * flt(obj.conversion_factor)
+		target.amount = pending_qty * flt(obj.rate)
+		target.base_amount = pending_qty * flt(obj.rate) * flt(source_parent.conversion_rate)
 
 	def select_item(d):
 		filtered_items = args.get("filtered_children", [])
@@ -2104,7 +2422,9 @@ def make_purchase_receipt(source_name, target_doc=None, args=None):
 					"wip_composite_asset": "wip_composite_asset",
 				},
 				"postprocess": update_item,
-				"condition": lambda doc: abs(doc.received_qty) < abs(doc.qty) and select_item(doc),
+				"condition": lambda doc: (
+					abs(received_and_mapped_qty(doc)) < abs(doc.qty) and select_item(doc)
+				),
 			},
 			"Purchase Taxes and Charges": {
 				"doctype": "Purchase Taxes and Charges",

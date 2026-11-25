@@ -28,8 +28,8 @@ erpnext.financial_statements = {
 	},
 
 	is_blank_row: function (data) {
+		if (!data || data.segment_values) return false;
 		return (
-			data &&
 			!data.account &&
 			!data.accounts &&
 			!data.child_accounts &&
@@ -40,7 +40,32 @@ erpnext.financial_statements = {
 
 	_is_special_view: function (column, data) {
 		if (!data) return false;
+
 		const view = get_filter_value("selected_view");
+
+		if (!["Growth", "Margin"].includes(view)) return false;
+
+		// First period of each dim has no prior in Growth → show raw currency, not %.
+		// Margin always shows % for all period columns (income row = 100%).
+		if (view === "Growth" && column.is_first_in_dimension) return false;
+
+		if (get_filter_value("report_template")) {
+			const columnInfo = erpnext.financial_statements._parse_column_info(column.fieldname, data);
+			// Account column
+			if (columnInfo.isAccount) return false;
+
+			const periodKeys = data._segment_info?.period_keys || [];
+
+			if (!periodKeys.includes(columnInfo.fieldname)) return false;
+
+			if (view === "Growth") {
+				// First period of new segment
+				if (periodKeys[0] === columnInfo.fieldname) return false;
+			}
+
+			return true;
+		}
+
 		return (view === "Growth" && column.colIndex >= 3) || (view === "Margin" && column.colIndex >= 2);
 	},
 
@@ -225,7 +250,7 @@ erpnext.financial_statements = {
 	},
 
 	_format_standard_report: function (value, row, column, data, default_formatter, filter) {
-		if (data && column.fieldname == erpnext.financial_statements.name_field) {
+		if (data && column.fieldname == frappe.query_report.report_settings.name_field) {
 			value = data.section_name || data.account_name || value;
 
 			if (filter && filter?.text && filter?.type == "contains") {
@@ -372,6 +397,18 @@ erpnext.financial_statements = {
 			});
 		}
 	},
+
+	get_accounting_dimension_options: function () {
+		const options = ["", "Cost Center", "Project"];
+		frappe.db
+			.get_list("Accounting Dimension", { fields: ["document_type"], filters: { disabled: 0 } })
+			.then((res) => {
+				res.forEach((dimension) => {
+					options.push(dimension.document_type);
+				});
+			});
+		return options;
+	},
 };
 
 function get_filters() {
@@ -475,7 +512,7 @@ function get_filters() {
 			label: __("Cost Center"),
 			fieldtype: "MultiSelectList",
 			get_data: function (txt) {
-				return frappe.db.get_link_options("Cost Center", txt, {
+				return erpnext.utils.get_link_options("Cost Center", txt, {
 					company: get_filter_value("company"),
 				});
 			},
@@ -486,7 +523,7 @@ function get_filters() {
 			label: __("Project"),
 			fieldtype: "MultiSelectList",
 			get_data: function (txt) {
-				return frappe.db.get_link_options("Project", txt, {
+				return erpnext.utils.get_link_options("Project", txt, {
 					company: get_filter_value("company"),
 				});
 			},

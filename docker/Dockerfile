@@ -7,12 +7,13 @@
 #
 # Build:
 #   docker build --platform linux/arm64 -f docker/Dockerfile \
-#     -t axerp:v16.26.2-axerp.5 -t axerp:prod .
+#     -t axerp:v16.36.1-axerp -t axerp:prod .
 
-ARG ERPNEXT_VERSION=v16.26.2
+ARG ERPNEXT_VERSION=v16.36.1
 ARG HRMS_VERSION=version-16
 ARG CRM_VERSION=main
-# insights version-3 is frappe 14/15 only; develop branch has explicit v16 CI
+# develop is v16-compatible. Its frontend imports @framework/ui modules that
+# the v16.36.1 base image does not ship; those are copied in below.
 ARG INSIGHTS_VERSION=develop
 ARG WIKI_VERSION=version-3
 ARG BLOG_VERSION=develop
@@ -41,11 +42,32 @@ RUN git clone --depth 1 --branch ${CRM_VERSION} \
       /home/frappe/frappe-bench/apps/crm \
     && chown -R frappe:frappe /home/frappe/frappe-bench/apps/crm
 
-# ── Insights (develop = v16-compatible) ───────────────────────────────────
+# ── Insights ──────────────────────────────────────────────────────────────
 RUN git clone --depth 1 --branch ${INSIGHTS_VERSION} \
       https://github.com/frappe/insights.git \
       /home/frappe/frappe-bench/apps/insights \
-    && chown -R frappe:frappe /home/frappe/frappe-bench/apps/insights
+ && chown -R frappe:frappe /home/frappe/frappe-bench/apps/insights
+
+# Insights develop imports @framework/ui/telemetry, TrialBanner, and the island
+# builder. Those landed on frappe develop after the v16.36.1 image was built.
+# Copy only the missing paths onto the base image's frappe ui package.
+RUN git clone --depth 1 --filter=blob:none --sparse --branch develop \
+      https://github.com/frappe/frappe.git /tmp/frappe-ui \
+ && git -C /tmp/frappe-ui sparse-checkout set \
+      ui/src/telemetry \
+      ui/src/components/TrialBanner \
+      ui/island \
+      ui/vite/island \
+      ui/patches \
+ && UI=/home/frappe/frappe-bench/apps/frappe/ui \
+ && cp -a /tmp/frappe-ui/ui/src/telemetry "${UI}/src/telemetry" \
+ && cp -a /tmp/frappe-ui/ui/src/components/TrialBanner "${UI}/src/components/TrialBanner" \
+ && cp -a /tmp/frappe-ui/ui/island "${UI}/island" \
+ && cp -a /tmp/frappe-ui/ui/vite/island "${UI}/vite/island" \
+ && if [ -d /tmp/frappe-ui/ui/patches ]; then cp -a /tmp/frappe-ui/ui/patches "${UI}/patches"; fi \
+ && python3 -c 'import json; p="/home/frappe/frappe-bench/apps/frappe/ui/package.json"; pkg=json.load(open(p)); e=pkg.setdefault("exports", {}); e.setdefault("./island", {"import": "./island/index.js"}); e.setdefault("./island/host", {"import": "./island/host.js"}); e["./island/Island.vue"]="./island/Island.vue"; e.setdefault("./vite/island", {"import": "./vite/island/index.js"}); f=open(p,"w"); json.dump(pkg, f, indent=2); f.write("\n"); f.close()' \
+ && rm -rf /tmp/frappe-ui \
+ && chown -R frappe:frappe /home/frappe/frappe-bench/apps/frappe/ui
 
 # ── Wiki ──────────────────────────────────────────────────────────────────
 RUN git clone --depth 1 --branch ${WIKI_VERSION} \
@@ -87,6 +109,13 @@ RUN cd apps/hrms && yarn add html2canvas --silent
 # so the lockfile is current before frappe's frozen check runs.
 RUN cd apps/crm && yarn install --no-frozen-lockfile --silent
 RUN cd apps/crm/frontend && yarn install --no-frozen-lockfile --silent
+
+# Insights frontend links @framework/ui to apps/frappe/ui. Install after the
+# telemetry/TrialBanner/island overlay so the link and postinstall patches resolve.
+RUN cd apps/insights/frontend && yarn install --no-frozen-lockfile --silent
+# Desk Dashboard and Dashboard Chart render through these islands.
+# bench build does not produce them; without this step assets.json 404s.
+RUN cd apps/insights/frontend && yarn build:islands --production
 
 # hrms Vite build imports socketio_port from sites/common_site_config.json
 # at build time. This file doesn't exist during docker build (it's created

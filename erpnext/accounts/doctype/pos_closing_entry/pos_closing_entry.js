@@ -34,7 +34,7 @@ frappe.ui.form.on("POS Closing Entry", {
 	},
 
 	refresh: function (frm) {
-		if (frm.doc.docstatus == 1 && frm.doc.status == "Failed") {
+		if (frm.doc.docstatus > 0 && frm.doc.status == "Failed") {
 			const issue = '<a id="jump_to_error" style="text-decoration: underline;">issue</a>';
 			frm.dashboard.set_headline(
 				__(
@@ -151,7 +151,7 @@ function refresh_payments(payments, frm) {
 				mode_of_payment: p.mode_of_payment,
 				opening_amount: 0,
 				expected_amount: p.amount,
-				closing_amount: 0,
+				closing_amount: p.amount,
 			});
 		}
 	});

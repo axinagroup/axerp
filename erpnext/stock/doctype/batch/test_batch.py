@@ -20,7 +20,9 @@ from erpnext.stock.doctype.serial_and_batch_bundle.test_serial_and_batch_bundle 
 )
 from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
 from erpnext.stock.get_item_details import ItemDetailsCtx, get_item_details
+from erpnext.stock.report.stock_qty_vs_batch_qty.stock_qty_vs_batch_qty import execute, update_batch_qty
 from erpnext.stock.serial_batch_bundle import SerialBatchCreation
+from erpnext.tests.permission_test_utils import as_user, make_fenced_user
 from erpnext.tests.utils import AXERPTestSuite
 
 
@@ -197,6 +199,88 @@ class TestBatch(AXERPTestSuite):
 			# Set user to session user
 			frappe.set_user(session_user)
 
+	def test_pos_reserved_batch_qty_of_other_warehouse_is_ignored(self):
+		from erpnext.accounts.doctype.pos_closing_entry.test_pos_closing_entry import (
+			init_user_and_profile,
+		)
+		from erpnext.accounts.doctype.pos_invoice.test_pos_invoice import create_pos_invoice
+		from erpnext.accounts.doctype.pos_opening_entry.test_pos_opening_entry import create_opening_entry
+		from erpnext.stock.doctype.stock_reconciliation.test_stock_reconciliation import (
+			create_batch_item_with_batch,
+		)
+
+		frappe.db.set_single_value("POS Settings", "invoice_type", "POS Invoice")
+		item_code = "_Test POS Batch Warehouse Item"
+		batch_no = "TestBatch-POS-WH 01"
+		create_batch_item_with_batch(item_code, batch_no)
+		for warehouse, qty in (("_Test Warehouse 1 - _TC", 3), ("_Test Warehouse - _TC", 7)):
+			make_stock_entry(
+				target=warehouse,
+				item_code=item_code,
+				qty=qty,
+				basic_rate=100,
+				batch_no=batch_no,
+				use_serial_batch_fields=1,
+			)
+
+		session_user = frappe.session.user
+		test_user, pos_profile = init_user_and_profile()
+		create_opening_entry(pos_profile, test_user.name)
+		pos_inv = create_pos_invoice(
+			item=item_code, rate=300, qty=2, warehouse="_Test Warehouse - _TC", do_not_save=1
+		)
+		pos_inv.append("payments", {"mode_of_payment": "Cash", "amount": 600})
+		pos_inv.items[0].use_serial_batch_fields = 1
+		pos_inv.items[0].batch_no = batch_no
+		pos_inv.submit()
+		frappe.set_user(session_user)
+
+		batches = get_batch_qty(
+			item_code=item_code, warehouse="_Test Warehouse 1 - _TC", consider_negative_batches=1
+		)
+		self.assertEqual(
+			[(d.batch_no, d.warehouse, d.qty) for d in batches], [(batch_no, "_Test Warehouse 1 - _TC", 3)]
+		)
+
+	@AXERPTestSuite.change_settings("Stock Settings", {"use_serial_batch_fields": 0})
+	def test_pos_reserved_bundle_qty_of_other_batch_is_ignored(self):
+		from erpnext.accounts.doctype.pos_closing_entry.test_pos_closing_entry import (
+			init_user_and_profile,
+		)
+		from erpnext.accounts.doctype.pos_invoice.test_pos_invoice import create_pos_invoice
+		from erpnext.accounts.doctype.pos_opening_entry.test_pos_opening_entry import create_opening_entry
+		from erpnext.stock.doctype.stock_reconciliation.test_stock_reconciliation import (
+			create_batch_item_with_batch,
+		)
+
+		frappe.db.set_single_value("POS Settings", "invoice_type", "POS Invoice")
+		item_code = "_Test POS Batch Bundle Item"
+		batch_1 = "TestBatch-POS-SABB 01"
+		create_batch_item_with_batch(item_code, batch_1)
+		batch_2 = "TestBatch-POS-SABB 02"
+		create_batch_item_with_batch(item_code, batch_2)
+		for batch_no in (batch_1, batch_2):
+			make_stock_entry(
+				target="_Test Warehouse - _TC",
+				item_code=item_code,
+				qty=5,
+				basic_rate=100,
+				batch_no=batch_no,
+				use_serial_batch_fields=1,
+			)
+
+		session_user = frappe.session.user
+		test_user, pos_profile = init_user_and_profile()
+		create_opening_entry(pos_profile, test_user.name)
+		pos_inv = create_pos_invoice(item=item_code, rate=300, qty=2, do_not_save=1)
+		pos_inv.append("payments", {"mode_of_payment": "Cash", "amount": 600})
+		pos_inv.items[0].batch_no = batch_2
+		pos_inv.submit()
+		frappe.set_user(session_user)
+
+		batches = get_batch_qty(batch_no=batch_1, item_code=item_code, consider_negative_batches=1)
+		self.assertEqual([(d.batch_no, d.qty) for d in batches], [(batch_1, 5)])
+
 	def test_stock_entry_incoming(self):
 		"""Test batch creation via Stock Entry (Work Order)"""
 
@@ -276,6 +360,187 @@ class TestBatch(AXERPTestSuite):
 			get_batch_from_bundle(delivery_note.items[0].serial_and_batch_bundle),
 			batch_no,
 		)
+
+	def make_delivery_note_with_bundle(self, receipt, batch_no, qty):
+		bundle_id = (
+			SerialBatchCreation(
+				{
+					"item_code": receipt.items[0].item_code,
+					"warehouse": receipt.items[0].warehouse,
+					"actual_qty": qty,
+					"voucher_type": "Delivery Note",
+					"batches": frappe._dict({batch_no: qty}),
+					"type_of_transaction": "Outward",
+					"company": receipt.company,
+					"do_not_submit": 1,
+				}
+			)
+			.make_serial_and_batch_bundle()
+			.name
+		)
+
+		return frappe.get_doc(
+			doctype="Delivery Note",
+			customer="_Test Customer",
+			company=receipt.company,
+			items=[
+				dict(
+					item_code=receipt.items[0].item_code,
+					qty=qty,
+					rate=10,
+					warehouse=receipt.items[0].warehouse,
+					serial_and_batch_bundle=bundle_id,
+				)
+			],
+		)
+
+	def test_expired_batch_in_bundle_cannot_be_delivered(self):
+		from erpnext.exceptions import BatchExpiredError
+
+		receipt = self.test_purchase_receipt(10)
+		batch_no = get_batch_from_bundle(receipt.items[0].serial_and_batch_bundle)
+		frappe.db.set_value("Batch", batch_no, "expiry_date", add_to_date(getdate(), days=-5))
+
+		delivery_note = self.make_delivery_note_with_bundle(receipt, batch_no, 2)
+		self.assertRaises(BatchExpiredError, delivery_note.insert)
+
+	def test_disabled_batch_cannot_be_delivered(self):
+		receipt = self.test_purchase_receipt(10)
+		batch_no = get_batch_from_bundle(receipt.items[0].serial_and_batch_bundle)
+		frappe.db.set_value("Batch", batch_no, "disabled", 1)
+
+		delivery_note = self.make_delivery_note_with_bundle(receipt, batch_no, 2)
+		self.assertRaises(frappe.ValidationError, delivery_note.insert)
+
+	@AXERPTestSuite.change_settings("Stock Settings", {"use_serial_batch_fields": 1})
+	def test_invoice_of_delivery_note_with_batch_expired_after_delivery_is_submitted(self):
+		from erpnext.stock.doctype.delivery_note.delivery_note import make_sales_invoice
+
+		receipt = self.test_purchase_receipt(10)
+		batch_no = get_batch_from_bundle(receipt.items[0].serial_and_batch_bundle)
+		delivery_note = frappe.get_doc(
+			doctype="Delivery Note",
+			customer="_Test Customer",
+			company=receipt.company,
+			items=[
+				dict(
+					item_code=receipt.items[0].item_code,
+					qty=3,
+					rate=10,
+					warehouse=receipt.items[0].warehouse,
+					batch_no=batch_no,
+					use_serial_batch_fields=1,
+				)
+			],
+		).insert()
+		delivery_note.submit()
+		frappe.db.set_value("Batch", batch_no, "expiry_date", add_to_date(getdate(), days=-1))
+
+		sales_invoice = make_sales_invoice(delivery_note.name)
+		sales_invoice.insert()
+		sales_invoice.submit()
+		self.assertEqual(sales_invoice.items[0].batch_no, batch_no)
+
+	def test_disabled_batch_cannot_be_issued(self):
+		receipt = self.test_purchase_receipt(10)
+		batch_no = get_batch_from_bundle(receipt.items[0].serial_and_batch_bundle)
+		frappe.db.set_value("Batch", batch_no, "disabled", 1)
+
+		self.assertRaises(
+			frappe.ValidationError,
+			make_stock_entry,
+			item_code=receipt.items[0].item_code,
+			source=receipt.items[0].warehouse,
+			qty=2,
+			batch_no=batch_no,
+			purpose="Material Issue",
+		)
+
+	def test_expired_packed_item_batch_cannot_be_delivered(self):
+		from erpnext.exceptions import BatchExpiredError
+
+		receipt = self.test_purchase_receipt(10)
+		batch_no = get_batch_from_bundle(receipt.items[0].serial_and_batch_bundle)
+		frappe.db.set_value("Batch", batch_no, "expiry_date", add_to_date(getdate(), days=-5))
+
+		delivery_note = self.make_delivery_note_with_bundle(receipt, batch_no, 2)
+		delivery_note.posting_date = getdate()
+		row = delivery_note.items[0]
+		delivery_note.append(
+			"packed_items",
+			{
+				"item_code": row.item_code,
+				"warehouse": row.warehouse,
+				"qty": 2,
+				"serial_and_batch_bundle": row.serial_and_batch_bundle,
+			},
+		)
+		row.serial_and_batch_bundle = None
+
+		self.assertRaises(BatchExpiredError, delivery_note.validate_outward_bundle_batches)
+
+	def test_batch_stock_endpoints_need_batch_access(self):
+		from frappe.core.doctype.user_permission.test_user_permission import create_user
+
+		from erpnext.stock.doctype.batch.batch import get_batches_by_oldest, get_pos_reserved_batch_qty
+
+		portal_user = create_user("test_batch_portal@example.com", "Customer")
+		sales_user = create_user("test_batch_sales@example.com", "Sales User")
+		kwargs = {"item_code": "ITEM-BATCH-1", "warehouse": "_Test Warehouse - _TC"}
+
+		frappe.set_user(portal_user.name)
+		try:
+			self.assertRaises(frappe.PermissionError, get_batch_qty, **kwargs)
+			self.assertRaises(frappe.PermissionError, get_batches_by_oldest, **kwargs)
+			self.assertRaises(frappe.PermissionError, get_pos_reserved_batch_qty, kwargs)
+
+			frappe.set_user(sales_user.name)
+			get_batch_qty(**kwargs)
+		finally:
+			frappe.set_user("Administrator")
+
+	def test_batch_qty_respects_warehouse_user_permissions(self):
+		item = make_item(properties={"has_batch_no": 1, "create_new_batch": 1})
+		batch = frappe.get_doc(doctype="Batch", item=item.name).insert()
+		make_stock_entry(item_code=item.name, batch_no=batch.name, qty=3, target="Stores - _TC", rate=100)
+		make_stock_entry(
+			item_code=item.name, batch_no=batch.name, qty=7, target="Finished Goods - _TC", rate=100
+		)
+		user = make_fenced_user(
+			f"batch-warehouse-{frappe.generate_hash(length=8)}@example.com",
+			["Stock User", "Item Manager"],
+			[("Warehouse", "Stores - _TC")],
+		)
+
+		with as_user(user):
+			with self.assertRaises(frappe.PermissionError):
+				get_batch_qty(batch_no=batch.name, warehouse="Finished Goods - _TC")
+			self.assertEqual(get_batch_qty(batch_no=batch.name, warehouse="Stores - _TC"), 3)
+			self.assertEqual(
+				[(row.batch_no, row.warehouse, row.qty) for row in get_batch_qty(item_code=item.name)],
+				[(batch.name, "Stores - _TC", 3)],
+			)
+			batch.recalculate_batch_qty()
+			self.assertEqual(batch.reload().batch_qty, 10)
+
+	def test_warehouse_restricted_user_updates_total_batch_qty(self):
+		item = make_item(properties={"has_batch_no": 1, "create_new_batch": 1})
+		batch = frappe.get_doc(doctype="Batch", item=item.name).insert()
+		make_stock_entry(item_code=item.name, batch_no=batch.name, qty=10, target="Stores - _TC", rate=100)
+		make_stock_entry(
+			item_code=item.name, batch_no=batch.name, qty=5, target="Finished Goods - _TC", rate=100
+		)
+		frappe.db.set_value("Batch", batch.name, "batch_qty", 7)
+		user = make_fenced_user(
+			f"batch-report-{frappe.generate_hash(length=8)}@example.com",
+			["Item Manager"],
+			[("Warehouse", "Stores - _TC")],
+		)
+		with as_user(user):
+			rows = execute(frappe._dict(company="_Test Company", item=item.name))[1]
+			self.assertEqual([(row["stock_qty"], row["batch_qty"]) for row in rows], [(15, 7)])
+			update_batch_qty(frappe.as_json(rows))
+		self.assertEqual(batch.reload().batch_qty, 15)
 
 	def test_batch_negative_stock_error(self):
 		"""Test automatic batch selection for outgoing items"""
@@ -359,6 +624,28 @@ class TestBatch(AXERPTestSuite):
 
 		self.assertEqual(get_batch_qty(batch_no, receipt.items[0].warehouse), 78)
 		self.assertEqual(get_batch_qty(new_batch, receipt.items[0].warehouse), 22)
+
+	def test_split_batch_keeps_source_dates_and_parent(self):
+		from erpnext.stock.doctype.batch.batch import split_batch
+
+		receipt = self.test_purchase_receipt()
+		batch_no = get_batch_from_bundle(receipt.items[0].serial_and_batch_bundle)
+		frappe.db.set_value(
+			"Batch",
+			batch_no,
+			{
+				"manufacturing_date": add_to_date(getdate(), days=-60),
+				"expiry_date": add_to_date(getdate(), days=5),
+			},
+		)
+
+		new_batch = split_batch(batch_no, "ITEM-BATCH-1", receipt.items[0].warehouse, 4)
+
+		fields = ["manufacturing_date", "expiry_date"]
+		self.assertEqual(
+			frappe.db.get_value("Batch", new_batch, fields), frappe.db.get_value("Batch", batch_no, fields)
+		)
+		self.assertEqual(frappe.db.get_value("Batch", new_batch, "parent_batch"), batch_no)
 
 	def test_get_batch_qty(self):
 		"""Test getting batch quantities by batch_numbers, item_code or warehouse"""
@@ -516,6 +803,23 @@ class TestBatch(AXERPTestSuite):
 			frappe.set_value("Stock Settings", "Stock Settings", "naming_series_prefix", original_prefix)
 			frappe.set_value("Stock Settings", "Stock Settings", "use_naming_series", use_naming_series)
 
+	@AXERPTestSuite.change_settings(
+		"Stock Settings", {"use_naming_series": 1, "naming_series_prefix": "batch-.{item}.-"}
+	)
+	def test_naming_series_prefix_with_fieldname(self):
+		batch = self.make_new_batch("_Test Stock Item For Batch Fieldname")
+		self.assertTrue(batch.batch_id.startswith("BATCH-_Test Stock Item For Batch Fieldname-"))
+
+	@AXERPTestSuite.change_settings(
+		"Stock Settings", {"use_naming_series": 1, "naming_series_prefix": "batch-.{item}.-"}
+	)
+	def test_naming_series_prefix_with_fieldname_reverts_on_delete(self):
+		batch = self.make_new_batch("_Test Stock Item For Batch Fieldname Revert")
+		batch.delete()
+
+		new_batch = self.make_new_batch("_Test Stock Item For Batch Fieldname Revert")
+		self.assertEqual(new_batch.batch_id, batch.batch_id)
+
 	def make_new_batch(self, item_name=None, batch_id=None, do_not_insert=0):
 		batch = frappe.new_doc("Batch")
 		item = self.make_batch_item(item_name)
@@ -557,7 +861,7 @@ class TestBatch(AXERPTestSuite):
 				"currency": currency,
 				"doctype": "Sales Invoice",
 				"conversion_rate": 1,
-				"price_list_currency": "_Test Currency",
+				"price_list_currency": "INR",
 				"plc_conversion_rate": 1,
 				"customer": "_Test Customer",
 				"name": None,
@@ -643,6 +947,29 @@ class TestBatch(AXERPTestSuite):
 
 		self.assertEqual(getdate(batch.expiry_date), getdate(expiry_date))
 
+	def test_auto_created_batch_expiry_counts_from_receipt_date(self):
+		item_code = make_item(
+			properties={
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"has_expiry_date": 1,
+				"shelf_life_in_days": 10,
+				"batch_number_series": "BEXPRD-.###",
+			}
+		).name
+		posting_date = add_to_date(getdate(), days=-30)
+
+		receipt = make_purchase_receipt(item_code=item_code, qty=5, posting_date=posting_date)
+
+		batch = frappe.db.get_value(
+			"Batch",
+			get_batch_from_bundle(receipt.items[0].serial_and_batch_bundle),
+			["manufacturing_date", "expiry_date"],
+			as_dict=True,
+		)
+		self.assertEqual(batch.manufacturing_date, posting_date)
+		self.assertEqual(batch.expiry_date, add_to_date(posting_date, days=10))
+
 	def test_autocreation_of_batches(self):
 		"""
 		Test if auto created Serial No excludes existing serial numbers
@@ -669,6 +996,89 @@ class TestBatch(AXERPTestSuite):
 		)
 
 		self.assertEqual("BATCHEXISTING002", get_batch_from_bundle(pr_2.items[0].serial_and_batch_bundle))
+
+	@AXERPTestSuite.change_settings("Stock Settings", {"use_serial_batch_fields": 0})
+	def test_pos_reserved_batch_with_bundle_is_counted_once(self):
+		from erpnext.accounts.doctype.pos_closing_entry.test_pos_closing_entry import (
+			init_user_and_profile,
+		)
+		from erpnext.accounts.doctype.pos_invoice.test_pos_invoice import create_pos_invoice
+		from erpnext.accounts.doctype.pos_opening_entry.test_pos_opening_entry import create_opening_entry
+		from erpnext.stock.doctype.stock_reconciliation.test_stock_reconciliation import (
+			create_batch_item_with_batch,
+		)
+
+		frappe.db.set_single_value("POS Settings", "invoice_type", "POS Invoice")
+		item_code = "_Test POS Batch Bundle Once Item"
+		batch_no = "TestBatch-POS-Once 01"
+		create_batch_item_with_batch(item_code, batch_no)
+		make_stock_entry(
+			target="_Test Warehouse - _TC",
+			item_code=item_code,
+			qty=7,
+			basic_rate=100,
+			batch_no=batch_no,
+			use_serial_batch_fields=1,
+		)
+
+		session_user = frappe.session.user
+		test_user, pos_profile = init_user_and_profile()
+		create_opening_entry(pos_profile, test_user.name)
+		pos_inv = create_pos_invoice(
+			item=item_code, rate=300, qty=2, warehouse="_Test Warehouse - _TC", do_not_save=1
+		)
+		pos_inv.append("payments", {"mode_of_payment": "Cash", "amount": 600})
+		pos_inv.items[0].batch_no = batch_no
+		pos_inv.submit()
+		frappe.set_user(session_user)
+		self.assertTrue(pos_inv.items[0].serial_and_batch_bundle)
+
+		batches = get_batch_qty(
+			item_code=item_code, warehouse="_Test Warehouse - _TC", consider_negative_batches=1
+		)
+		self.assertEqual([(d.batch_no, d.qty) for d in batches], [(batch_no, 5)])
+
+	@AXERPTestSuite.change_settings("Stock Settings", {"use_serial_batch_fields": 0})
+	def test_pos_reservation_of_expired_batch_is_skipped(self):
+		from erpnext.accounts.doctype.pos_closing_entry.test_pos_closing_entry import (
+			init_user_and_profile,
+		)
+		from erpnext.accounts.doctype.pos_invoice.test_pos_invoice import create_pos_invoice
+		from erpnext.accounts.doctype.pos_opening_entry.test_pos_opening_entry import create_opening_entry
+		from erpnext.stock.doctype.stock_reconciliation.test_stock_reconciliation import (
+			create_batch_item_with_batch,
+		)
+
+		frappe.db.set_single_value("POS Settings", "invoice_type", "POS Invoice")
+		item_code = "_Test POS Expired Batch Item"
+		batch_no = "TestBatch-POS-Expired 01"
+		create_batch_item_with_batch(item_code, batch_no)
+		make_stock_entry(
+			target="_Test Warehouse - _TC",
+			item_code=item_code,
+			qty=5,
+			basic_rate=100,
+			batch_no=batch_no,
+			use_serial_batch_fields=1,
+		)
+
+		session_user = frappe.session.user
+		test_user, pos_profile = init_user_and_profile()
+		create_opening_entry(pos_profile, test_user.name)
+		pos_inv = create_pos_invoice(
+			item=item_code, rate=300, qty=2, warehouse="_Test Warehouse - _TC", do_not_save=1
+		)
+		pos_inv.append("payments", {"mode_of_payment": "Cash", "amount": 600})
+		pos_inv.items[0].batch_no = batch_no
+		pos_inv.submit()
+		frappe.set_user(session_user)
+
+		frappe.db.set_value("Batch", batch_no, "expiry_date", add_to_date(getdate(), days=-1))
+
+		batches = get_batch_qty(
+			item_code=item_code, warehouse="_Test Warehouse - _TC", consider_negative_batches=1
+		)
+		self.assertEqual(batches, [])
 
 
 def create_batch(item_code, rate, create_item_price_for_batch):

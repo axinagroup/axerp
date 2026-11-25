@@ -43,7 +43,8 @@ class AccountingDimension(Document):
 	def validate(self):
 		self.validate_doctype()
 		validate_column_name(self.fieldname)
-		self.validate_fieldname_conflict()
+		if self.has_value_changed("fieldname"):
+			self.validate_fieldname_conflict()
 		self.validate_dimension_defaults()
 
 	def validate_doctype(self):
@@ -59,6 +60,14 @@ class AccountingDimension(Document):
 		):
 			msg = _("Not allowed to create accounting dimension for {0}").format(self.document_type)
 			frappe.throw(msg)
+
+		meta = frappe.get_meta(self.document_type)
+		if meta.istable or meta.issingle:
+			frappe.throw(
+				_(
+					"{0} cannot be used as an accounting dimension as it is not a standalone document type."
+				).format(frappe.bold(self.document_type))
+			)
 
 		exists = frappe.db.get_value("Accounting Dimension", {"document_type": self.document_type}, ["name"])
 
@@ -227,8 +236,11 @@ def delete_accounting_dimension(doc):
 		frappe.clear_cache(doctype=doctype)
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def disable_dimension(doc):
+	# toggle_disabling rewrites a Custom Field site-wide, so demand the write that configures dimensions
+	frappe.has_permission("Accounting Dimension", "write", throw=True)
+
 	if frappe.in_test:
 		toggle_disabling(doc=doc)
 	else:
@@ -357,3 +369,13 @@ def create_accounting_dimensions_for_doctype(doctype):
 		create_custom_field(doctype, df, ignore_validate=True)
 
 	frappe.clear_cache(doctype=doctype)
+
+
+def get_dimension_fieldname(dim_doctype: str) -> str:
+	"""
+	Return the `GL Entry` fieldname for a given dimension.
+	"""
+	if dim_doctype in ("Cost Center", "Project"):
+		return frappe.scrub(dim_doctype)
+
+	return frappe.db.get_value("Accounting Dimension", {"document_type": dim_doctype}, "fieldname")

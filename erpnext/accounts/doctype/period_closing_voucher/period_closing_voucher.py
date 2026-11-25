@@ -6,17 +6,24 @@ import copy
 
 import frappe
 from frappe import _
-from frappe.query_builder.functions import Sum
-from frappe.utils import add_days, flt, formatdate, getdate
+from frappe.query_builder.functions import Max, Sum
+from frappe.utils import add_days, flt, fmt_money, formatdate, get_link_to_form, getdate
 
+from erpnext import is_perpetual_inventory_enabled
 from erpnext.accounts.doctype.account_closing_balance.account_closing_balance import (
 	make_closing_entries,
 )
 from erpnext.accounts.doctype.accounting_dimension.accounting_dimension import (
 	get_accounting_dimensions,
 )
-from erpnext.accounts.utils import get_account_currency, get_fiscal_year
+from erpnext.accounts.doctype.gl_entry.gl_entry import validate_frozen_account
+from erpnext.accounts.general_ledger import check_freezing_date
+from erpnext.accounts.utils import get_account_currency
 from erpnext.controllers.accounts_controller import AccountsController
+from erpnext.stock.doctype.stock_closing_entry.stock_closing_entry import apply_unscoped_filters
+from erpnext.stock.utils import get_stock_value_on
+
+STOCK_VALUE_TOLERANCE_PERCENT = 1
 
 
 class PeriodClosingVoucher(AccountsController):
@@ -37,15 +44,20 @@ class PeriodClosingVoucher(AccountsController):
 		period_end_date: DF.Date
 		period_start_date: DF.Date
 		remarks: DF.SmallText
+		stock_value_difference: DF.Currency
 		transaction_date: DF.Date | None
 	# end: auto-generated types
 
 	def validate(self):
 		self.validate_start_and_end_date()
-		self.check_if_previous_year_closed()
+		self.check_if_previous_period_closed()
 		self.block_if_future_closing_voucher_exists()
-		self.check_closing_account_type()
+		self.check_closing_account()
 		self.check_closing_account_currency()
+		self.validate_accounts_not_frozen()
+
+	def validate_accounts_not_frozen(self):
+		check_freezing_date(self.period_end_date, self.company)
 
 	def validate_start_and_end_date(self):
 		self.fy_start_date, self.fy_end_date = frappe.db.get_value(
@@ -68,45 +80,65 @@ class PeriodClosingVoucher(AccountsController):
 		if getdate(self.period_end_date) > getdate(self.fy_end_date):
 			frappe.throw(_("Period End Date cannot be greater than Fiscal Year End Date"))
 
-	def check_if_previous_year_closed(self):
-		last_year_closing = add_days(self.fy_start_date, -1)
-		previous_fiscal_year = get_fiscal_year(last_year_closing, company=self.company, boolean=True)
-		if not previous_fiscal_year:
+	def check_if_previous_period_closed(self):
+		last_closing = self.get_last_closing()
+		if last_closing and last_closing.gle_processing_status != "Completed":
+			frappe.throw(
+				_(
+					"Period Closing Voucher {0} has GL Entry Processing Status {1}. Complete or cancel it before closing the next period."
+				).format(
+					get_link_to_form(self.doctype, last_closing.name), _(last_closing.gle_processing_status)
+				)
+			)
+
+		last_closed_date = last_closing.period_end_date if last_closing else None
+		if last_closed_date and getdate(add_days(last_closed_date, 1)) == getdate(self.period_start_date):
 			return
 
-		previous_fiscal_year_start_date = previous_fiscal_year[0][1]
-		previous_fiscal_year_closed = frappe.db.exists(
+		first_unclosed_date = self.get_first_unclosed_date(last_closed_date)
+		if first_unclosed_date:
+			open_from = add_days(last_closed_date, 1) if last_closed_date else first_unclosed_date
+			frappe.throw(
+				_("Previous period is not closed. Close the period from {0} first.").format(
+					frappe.bold(formatdate(open_from))
+				)
+			)
+
+	def get_last_closing(self):
+		return frappe.db.get_value(
 			"Period Closing Voucher",
-			{
-				"period_end_date": ("between", [previous_fiscal_year_start_date, last_year_closing]),
-				"docstatus": 1,
-				"company": self.company,
-			},
+			{"company": self.company, "docstatus": 1, "period_end_date": ("<", self.period_start_date)},
+			["name", "period_end_date", "gle_processing_status"],
+			order_by="period_end_date desc",
+			as_dict=True,
 		)
-		if previous_fiscal_year_closed:
-			return
 
-		gle_exists_in_previous_year = frappe.db.exists(
+	def get_first_unclosed_date(self, last_closed_date):
+		posting_date = ("<", self.period_start_date)
+		if last_closed_date:
+			posting_date = ("between", [add_days(last_closed_date, 1), add_days(self.period_start_date, -1)])
+
+		return frappe.db.get_value(
 			"GL Entry",
 			{
-				"posting_date": ("between", [previous_fiscal_year_start_date, last_year_closing]),
 				"company": self.company,
+				"posting_date": posting_date,
 				"is_cancelled": 0,
+				"is_opening": "No",
+				"voucher_type": ("!=", "Period Closing Voucher"),
 			},
+			"posting_date",
+			order_by="posting_date asc",
 		)
-		if not gle_exists_in_previous_year:
-			return
-
-		frappe.throw(_("Previous Year is not closed, please close it first"))
 
 	def block_if_future_closing_voucher_exists(self):
 		future_closing_voucher = self.get_future_closing_voucher()
-		if future_closing_voucher and future_closing_voucher[0][0]:
+		if future_closing_voucher:
 			action = "cancel" if self.docstatus == 2 else "create"
 			frappe.throw(
 				_(
 					"You cannot {0} this document because another Period Closing Entry {1} exists after {2}"
-				).format(action, future_closing_voucher[0][0], self.period_end_date)
+				).format(action, future_closing_voucher, self.period_end_date)
 			)
 
 	def get_future_closing_voucher(self):
@@ -116,19 +148,188 @@ class PeriodClosingVoucher(AccountsController):
 			"name",
 		)
 
-	def check_closing_account_type(self):
-		closing_account_type = frappe.get_cached_value("Account", self.closing_account_head, "root_type")
+	def check_closing_account(self):
+		account = frappe.get_cached_value(
+			"Account",
+			self.closing_account_head,
+			["root_type", "company", "is_group", "disabled"],
+			as_dict=True,
+		)
 
-		if closing_account_type not in ["Liability", "Equity"]:
+		if account.root_type not in ["Liability", "Equity"]:
 			frappe.throw(
 				_("Closing Account {0} must be of type Liability / Equity").format(self.closing_account_head)
 			)
+
+		if account.company != self.company:
+			frappe.throw(
+				_("Closing Account {0} does not belong to Company {1}").format(
+					self.closing_account_head, self.company
+				)
+			)
+
+		if account.is_group:
+			frappe.throw(_("Closing Account {0} cannot be a group account").format(self.closing_account_head))
+
+		if account.disabled:
+			frappe.throw(_("Closing Account {0} is disabled").format(self.closing_account_head))
+
+		validate_frozen_account(self.company, self.closing_account_head)
 
 	def check_closing_account_currency(self):
 		account_currency = get_account_currency(self.closing_account_head)
 		company_currency = frappe.get_cached_value("Company", self.company, "default_currency")
 		if account_currency != company_currency:
 			frappe.throw(_("Currency of the Closing Account must be {0}").format(company_currency))
+
+	def before_submit(self):
+		if not self.has_stock_transactions():
+			return
+
+		self.validate_stock_accounts_balance()
+		self.validate_stock_closing_entry()
+
+	def has_stock_transactions(self):
+		if not is_perpetual_inventory_enabled(self.company):
+			return False
+
+		return bool(
+			frappe.db.exists(
+				"Stock Ledger Entry",
+				{
+					"company": self.company,
+					"is_cancelled": 0,
+					"posting_date": ("<=", self.period_end_date),
+				},
+			)
+		)
+
+	def validate_stock_accounts_balance(self):
+		account_balance, stock_value, difference = self.get_stock_value_mismatch()
+		if not difference:
+			self.stock_value_difference = 0
+			return
+
+		if self.is_stock_value_difference_accepted(stock_value, difference):
+			return
+
+		currency = frappe.get_cached_value("Company", self.company, "default_currency")
+		frappe.throw(
+			_(
+				"The closing balance {0} of the Stock Asset accounts does not match the closing value {1} of the Stock Balance report as on {2}. Resolve the difference using the Stock Ledger Variance report before closing the period."
+			).format(
+				frappe.bold(fmt_money(account_balance, currency=currency)),
+				frappe.bold(fmt_money(stock_value, currency=currency)),
+				frappe.bold(formatdate(self.period_end_date)),
+			),
+			title=_("Stock Value Mismatch"),
+		)
+
+	def is_stock_value_difference_accepted(self, stock_value, difference):
+		precision = frappe.get_precision("GL Entry", "debit")
+		return is_within_stock_value_tolerance(stock_value, difference) and (
+			flt(self.stock_value_difference, precision) == difference
+		)
+
+	def get_stock_value_mismatch(self):
+		precision = frappe.get_precision("GL Entry", "debit")
+		account_balance = flt(self.get_stock_accounts_balance(), precision)
+		stock_value = flt(
+			get_stock_value_on(posting_date=self.period_end_date, company=self.company), precision
+		)
+
+		return account_balance, stock_value, flt(account_balance - stock_value, precision)
+
+	@frappe.whitelist()
+	def get_stock_value_difference(self) -> dict:
+		if not self.has_stock_transactions():
+			return {}
+
+		account_balance, stock_value, difference = self.get_stock_value_mismatch()
+		return {
+			"account_balance": account_balance,
+			"stock_value": stock_value,
+			"difference": difference,
+			"tolerance": STOCK_VALUE_TOLERANCE_PERCENT,
+			"within_tolerance": bool(difference) and is_within_stock_value_tolerance(stock_value, difference),
+		}
+
+	def get_stock_accounts_balance(self):
+		gle = frappe.qb.DocType("GL Entry")
+		account = frappe.qb.DocType("Account")
+
+		stock_accounts = (
+			frappe.qb.from_(account)
+			.select(account.name)
+			.where(
+				(account.account_type == "Stock")
+				& (account.company == self.company)
+				& (account.is_group == 0)
+			)
+		)
+
+		balance = (
+			frappe.qb.from_(gle)
+			.select(Sum(gle.debit - gle.credit))
+			.where(
+				(gle.company == self.company)
+				& (gle.is_cancelled == 0)
+				& (gle.posting_date <= self.period_end_date)
+				& gle.account.isin(stock_accounts)
+			)
+		).run()
+
+		return flt(balance[0][0]) if balance else 0.0
+
+	def validate_stock_closing_entry(self):
+		closing_entry = frappe.db.get_value(
+			"Stock Closing Entry",
+			apply_unscoped_filters(
+				{"company": self.company, "to_date": self.period_end_date, "docstatus": 1}
+			),
+			["name", "status", "modified"],
+			as_dict=True,
+		)
+
+		if not closing_entry:
+			frappe.throw(
+				_(
+					"Create a Stock Closing Entry for the entire company with To Date as {0} before submitting the Period Closing Voucher."
+				).format(frappe.bold(formatdate(self.period_end_date))),
+				title=_("Stock Closing Entry Required"),
+			)
+
+		if closing_entry.status == "Outdated":
+			self.throw_outdated_stock_closing_entry(closing_entry)
+
+		if closing_entry.status != "Completed":
+			frappe.throw(
+				_(
+					"The Stock Closing Entry for {0} is not completed yet. Wait for it to complete before submitting the Period Closing Voucher."
+				).format(frappe.bold(formatdate(self.period_end_date))),
+				title=_("Stock Closing Entry In Progress"),
+			)
+
+		self.validate_stock_closing_entry_is_fresh(closing_entry)
+
+	def validate_stock_closing_entry_is_fresh(self, closing_entry):
+		sle = frappe.qb.DocType("Stock Ledger Entry")
+		last_change = (
+			frappe.qb.from_(sle)
+			.select(Max(sle.modified))
+			.where((sle.company == self.company) & (sle.posting_date <= self.period_end_date))
+		).run()
+
+		if last_change and last_change[0][0] and last_change[0][0] > closing_entry.modified:
+			self.throw_outdated_stock_closing_entry(closing_entry)
+
+	def throw_outdated_stock_closing_entry(self, closing_entry):
+		frappe.throw(
+			_(
+				"Stock transactions were created or modified after the Stock Closing Entry {0} was generated. Regenerate it before submitting the Period Closing Voucher."
+			).format(get_link_to_form("Stock Closing Entry", closing_entry.name)),
+			title=_("Stock Closing Entry Outdated"),
+		)
 
 	def on_submit(self):
 		self.db_set("gle_processing_status", "In Progress")
@@ -147,6 +348,7 @@ class PeriodClosingVoucher(AccountsController):
 			"Process Period Closing Voucher",
 		)
 		self.block_if_future_closing_voucher_exists()
+		self.validate_accounts_not_frozen()
 
 		if not frappe.get_single_value("Accounts Settings", "use_legacy_controller_for_pcv"):
 			self.cancel_process_pcv_docs()
@@ -181,7 +383,27 @@ class PeriodClosingVoucher(AccountsController):
 				alert=True,
 			)
 		else:
-			process_gl_and_closing_entries(self)
+			self.post_closing_entries()
+
+	def post_closing_entries(self):
+		from erpnext.accounts.general_ledger import make_gl_entries
+
+		gl_entries = self.get_pcv_gl_entries()
+		if gl_entries:
+			make_gl_entries(gl_entries, merge_entries=False)
+
+		closing_entries = self.get_account_closing_balances()
+		make_closing_entries(closing_entries, self.name, self.company, self.period_end_date)
+		self.db_set("gle_processing_status", "Completed")
+
+	def reverse_closing_entries(self):
+		from erpnext.accounts.general_ledger import make_reverse_gl_entries
+
+		make_reverse_gl_entries(
+			voucher_type=self.doctype, voucher_no=self.name, posting_date=self.period_end_date
+		)
+		delete_closing_entries(self.name)
+		self.db_set("gle_processing_status", "Completed")
 
 	def get_pcv_gl_entries(self):
 		self.pl_accounts_reverse_gle = []
@@ -189,14 +411,15 @@ class PeriodClosingVoucher(AccountsController):
 
 		pl_account_balances = self.get_account_balances_based_on_dimensions(report_type="Profit and Loss")
 		for dimensions, account_balances in pl_account_balances.items():
-			for acc, balances in account_balances.items():
-				balance_in_company_currency = flt(balances.debit) - flt(balances.credit)
-				if balance_in_company_currency and acc != "balances":
-					self.pl_accounts_reverse_gle.append(
-						self.get_gle_for_pl_account(acc, balances, dimensions)
-					)
+			pl_entries = [
+				self.get_gle_for_pl_account(acc, balances, dimensions)
+				for acc, balances in account_balances.items()
+				if acc != "balances" and has_balance(balances)
+			]
+			if not pl_entries:
+				continue
 
-			# closing liability account
+			self.pl_accounts_reverse_gle.extend(pl_entries)
 			self.closing_account_gle.append(
 				self.get_gle_for_closing_account(account_balances["balances"], dimensions)
 			)
@@ -452,7 +675,7 @@ class PeriodClosingVoucher(AccountsController):
 				alert=True,
 			)
 		else:
-			process_cancellation(voucher_type="Period Closing Voucher", voucher_no=self.name)
+			self.reverse_closing_entries()
 
 	def get_gle_count_against_current_pcv(self):
 		return frappe.db.count(
@@ -462,49 +685,32 @@ class PeriodClosingVoucher(AccountsController):
 
 
 def process_gl_and_closing_entries(doc):
-	from erpnext.accounts.general_ledger import make_gl_entries
-
-	try:
-		gl_entries = doc.get_pcv_gl_entries()
-		if gl_entries:
-			make_gl_entries(gl_entries, merge_entries=False)
-
-		closing_entries = doc.get_account_closing_balances()
-		make_closing_entries(closing_entries, doc.name, doc.company, doc.period_end_date)
-
-		frappe.db.set_value(doc.doctype, doc.name, "gle_processing_status", "Completed")
-	except Exception as e:
-		frappe.db.rollback()
-		frappe.log_error(title=_("Period Closing Voucher {0} GL Entry Processing Failed").format(doc.name))
-		frappe.db.set_value(
-			doc.doctype,
-			doc.name,
-			{
-				"error_message": str(e),
-				"gle_processing_status": "Failed",
-			},
-		)
+	run_and_record_failure(
+		doc.name,
+		_("Period Closing Voucher {0} GL Entry Processing Failed").format(doc.name),
+		doc.post_closing_entries,
+	)
 
 
 def process_cancellation(voucher_type, voucher_no):
-	from erpnext.accounts.general_ledger import make_reverse_gl_entries
+	run_and_record_failure(
+		voucher_no,
+		_("Period Closing Voucher {0} GL Entry Cancellation Failed").format(voucher_no),
+		frappe.get_doc(voucher_type, voucher_no).reverse_closing_entries,
+	)
 
+
+def run_and_record_failure(pcv_name, title, method, *args):
+	frappe.db.savepoint("period_closing")
 	try:
-		make_reverse_gl_entries(voucher_type=voucher_type, voucher_no=voucher_no)
-		delete_closing_entries(voucher_no)
-		frappe.db.set_value("Period Closing Voucher", voucher_no, "gle_processing_status", "Completed")
+		method(*args)
 	except Exception as e:
-		frappe.db.rollback()
-		frappe.log_error(
-			title=_("Period Closing Voucher {0} GL Entry Cancellation Failed").format(voucher_no)
-		)
+		frappe.db.rollback(save_point="period_closing")
+		frappe.log_error(title=title)
 		frappe.db.set_value(
-			voucher_type,
-			voucher_no,
-			{
-				"error_message": str(e),
-				"gle_processing_status": "Failed",
-			},
+			"Period Closing Voucher",
+			pcv_name,
+			{"error_message": str(e), "gle_processing_status": "Failed"},
 		)
 
 
@@ -517,6 +723,9 @@ def delete_closing_entries(voucher_no):
 
 @frappe.whitelist()
 def get_period_start_end_date(fiscal_year, company):
+	frappe.get_doc(
+		{"doctype": "Period Closing Voucher", "company": company, "fiscal_year": fiscal_year}
+	).check_permission("read")
 	fy_start_date, fy_end_date = frappe.db.get_value(
 		"Fiscal Year", fiscal_year, ["year_start_date", "year_end_date"]
 	)
@@ -539,3 +748,14 @@ def get_previous_closed_period_in_current_year(fiscal_year, company):
 		order_by="period_end_date desc",
 	)
 	return prev_closed_period_end_date
+
+
+def has_balance(balances):
+	return bool(
+		flt(balances.debit) - flt(balances.credit)
+		or flt(balances.debit_in_account_currency) - flt(balances.credit_in_account_currency)
+	)
+
+
+def is_within_stock_value_tolerance(stock_value, difference):
+	return abs(difference) <= abs(stock_value) * STOCK_VALUE_TOLERANCE_PERCENT / 100

@@ -25,6 +25,7 @@ from erpnext.accounts.doctype.accounting_dimension.accounting_dimension import (
 	get_accounting_dimensions,
 )
 from erpnext.accounts.doctype.subscription_plan.subscription_plan import get_plan_rate
+from erpnext.stock.doctype.item.item import get_item_defaults
 
 
 class InvoiceCancelled(frappe.ValidationError):
@@ -253,6 +254,9 @@ class Subscription(Document):
 		"""
 		Sets the status of the `Subscription`
 		"""
+		if self.status == "Cancelled":
+			return
+
 		if self.is_trialling():
 			self.status = "Trialing"
 		elif (
@@ -301,11 +305,11 @@ class Subscription(Document):
 		"""
 		Returns `True` if the grace period for the `Subscription` has passed
 		"""
-		if not self.current_invoice_is_past_due():
+		if not self.current_invoice_is_past_due(posting_date):
 			return False
 
 		grace_period = cint(frappe.get_value("Subscription Settings", None, "grace_period"))
-		return getdate(posting_date) >= getdate(add_days(self.current_invoice.due_date, grace_period))
+		return getdate(posting_date) > getdate(add_days(self.current_invoice.due_date, grace_period))
 
 	def current_invoice_is_past_due(self, posting_date: DateTimeLikeObject | None = None) -> bool:
 		"""
@@ -317,7 +321,7 @@ class Subscription(Document):
 		if not self.current_invoice.due_date:
 			return False
 
-		return getdate(posting_date) >= getdate(self.current_invoice.due_date)
+		return getdate(posting_date) > getdate(self.current_invoice.due_date)
 
 	@property
 	def invoice_document_type(self) -> str:
@@ -604,6 +608,11 @@ class Subscription(Document):
 		1. `process_for_active`
 		2. `process_for_past_due`
 		"""
+		# Snapshot before update_subscription_period() below can roll this forward,
+		# so the cancel_at_period_end check further down still targets the period
+		# that just ended, not the next one.
+		current_period_end = self.current_invoice_end
+
 		if not self.is_current_invoice_generated(
 			self.current_invoice_start, self.current_invoice_end
 		) and self.can_generate_new_invoice(posting_date):
@@ -621,11 +630,12 @@ class Subscription(Document):
 					return
 			self.update_subscription_period(add_days(self.current_invoice_end, 1))
 		elif posting_date and getdate(posting_date) > getdate(self.current_invoice_end):
-			self.update_subscription_period()
+			if not (self.end_date and getdate(self.current_invoice_end) >= getdate(self.end_date)):
+				self.update_subscription_period()
 
 		if self.cancel_at_period_end and (
-			getdate(posting_date) >= getdate(self.current_invoice_end)
-			or getdate(posting_date) >= getdate(self.end_date)
+			getdate(posting_date) >= getdate(current_period_end)
+			or (self.end_date and getdate(posting_date) >= getdate(self.end_date))
 		):
 			self.cancel_subscription()
 
@@ -666,10 +676,19 @@ class Subscription(Document):
 				date=add_days(self.current_invoice_end, 1)
 			)
 
-		if self.current_invoice and getdate(_current_start_date) <= getdate(
-			self.current_invoice.posting_date
-		) <= getdate(_current_end_date):
+		if self.end_date and getdate(_current_start_date) > getdate(self.end_date):
 			return True
+
+		invoice = self.current_invoice
+		if invoice:
+			if invoice.get("from_date"):
+				return getdate(invoice.from_date) == getdate(_current_start_date)
+			elif invoice.get("posting_date"):
+				return (
+					getdate(_current_start_date)
+					<= getdate(invoice.posting_date)
+					<= getdate(_current_end_date)
+				)
 
 		return False
 
@@ -799,6 +818,39 @@ def get_prorata_factor(
 	diff = flt(date_diff(nowdate(), period_start) + 1)
 	plan_days = flt(date_diff(period_end, period_start) + 1)
 	return diff / plan_days
+
+
+@frappe.whitelist()
+def get_plan_dimensions(
+	plan: str, company: str | None = None, party_type: str | None = None
+) -> dict[str, str]:
+	"""Resolve a plan's accounting dimensions, falling back to the plan item's company defaults."""
+	plan_doc = frappe.get_cached_doc("Subscription Plan", plan)
+
+	dimensions = {}
+	for dimension in ["cost_center", *get_accounting_dimensions()]:
+		value = plan_doc.get(dimension) or get_item_dimension(plan_doc.item, dimension, company, party_type)
+		if value:
+			dimensions[dimension] = value
+
+	return dimensions
+
+
+def get_item_dimension(
+	item_code: str, dimension: str, company: str | None, party_type: str | None
+) -> str | None:
+	if not company:
+		return None
+
+	item_defaults = get_item_defaults(item_code, company)
+	if dimension != "cost_center":
+		return item_defaults.get(dimension)
+
+	selling = item_defaults.get("selling_cost_center")
+	buying = item_defaults.get("buying_cost_center")
+	if party_type == "Supplier":
+		return buying or selling
+	return selling or buying
 
 
 def process_all(subscription: list, posting_date: DateTimeLikeObject | None = None) -> None:

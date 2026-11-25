@@ -69,7 +69,7 @@ erpnext.buying = {
 				if (this.frm.fields_dict.buying_price_list) {
 					this.frm.set_query("buying_price_list", function () {
 						return {
-							filters: { buying: 1 },
+							filters: { buying: 1, enabled: 1 },
 						};
 					});
 				}
@@ -77,7 +77,7 @@ erpnext.buying = {
 				if (this.frm.fields_dict.tc_name) {
 					this.frm.set_query("tc_name", function () {
 						return {
-							filters: { buying: 1 },
+							filters: { buying: 1, disabled: 0 },
 						};
 					});
 				}
@@ -91,7 +91,7 @@ erpnext.buying = {
 
 				this.frm.set_query("item_code", "items", function () {
 					if (me.frm.doc.is_subcontracted) {
-						var filters = { supplier: me.frm.doc.supplier };
+						var filters = { supplier: me.frm.doc.supplier, company: me.frm.doc.company };
 						if (me.frm.doc.is_old_subcontracting_flow) {
 							filters["is_sub_contracted_item"] = 1;
 						} else {
@@ -105,7 +105,12 @@ erpnext.buying = {
 					} else {
 						return {
 							query: "erpnext.controllers.queries.item_query",
-							filters: { supplier: me.frm.doc.supplier, is_purchase_item: 1, has_variants: 0 },
+							filters: {
+								supplier: me.frm.doc.supplier,
+								is_purchase_item: 1,
+								has_variants: 0,
+								company: me.frm.doc.company,
+							},
 						};
 					}
 				});
@@ -180,7 +185,11 @@ erpnext.buying = {
 
 						this.frm.set_value("billing_address", r.message.primary_address || "");
 
-						if (frappe.meta.has_field(this.frm.doc.doctype, "shipping_address")) {
+						const is_drop_ship = this.frm.doc.items.some((item) => item.delivered_by_supplier);
+						if (
+							frappe.meta.has_field(this.frm.doc.doctype, "shipping_address") &&
+							!is_drop_ship
+						) {
 							this.frm.set_value("shipping_address", r.message.shipping_address || "");
 						}
 					},
@@ -540,7 +549,7 @@ erpnext.buying.link_to_mrs = function (frm) {
 			var item_length = frm.doc.items.length;
 			for (let item of frm.doc.items) {
 				var qty = item.qty;
-				(r.message[0] || []).forEach(function (d) {
+				(r.message || []).forEach(function (d) {
 					if (
 						d.qty > 0 &&
 						qty > 0 &&

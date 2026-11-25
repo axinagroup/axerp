@@ -5,6 +5,9 @@ import frappe
 from frappe import _, qb, query_builder
 from frappe.query_builder import Criterion, functions
 from frappe.utils.dateutils import getdate
+from pypika.terms import Bracket, LiteralValue
+
+from erpnext.accounts.report.utils import validate_date_range
 
 
 def get_columns():
@@ -215,6 +218,11 @@ def get_so_with_invoices(filters):
 		.orderby(so.name, so.transaction_date, ps.due_date)
 	)
 
+	from frappe.desk.reportview import build_match_conditions
+
+	if match_conditions := build_match_conditions("Sales Order"):
+		query_so = query_so.where(Bracket(LiteralValue(match_conditions)))
+
 	sorders = query_so.run(as_dict=True)
 
 	invoices = []
@@ -303,6 +311,9 @@ def filter_for_immediate_upcoming_term(filters, sales_orders):
 
 
 def execute(filters=None):
+	validate_date_range(filters, "period_start_date", "period_end_date")
+	validate_date_range(filters, "from_due_date", "to_due_date")
+
 	columns = get_columns()
 	sales_orders, so_invoices = get_so_with_invoices(filters)
 	sales_orders, so_invoices = set_payment_terms_statuses(sales_orders, so_invoices, filters)

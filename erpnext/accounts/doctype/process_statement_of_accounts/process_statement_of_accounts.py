@@ -75,6 +75,7 @@ class ProcessStatementOfAccounts(Document):
 		sender: DF.Link | None
 		show_future_payments: DF.Check
 		show_net_values_in_party_account: DF.Check
+		show_opening_entries: DF.Check
 		show_remarks: DF.Check
 		start_date: DF.Date | None
 		subject: DF.Data | None
@@ -99,17 +100,35 @@ class ProcessStatementOfAccounts(Document):
 		if not self.pdf_name:
 			self.pdf_name = "{{ customer.customer_name }}"
 
-		validate_template(self.subject)
-		validate_template(self.body)
-		validate_template(self.pdf_name)
+		validate_template(self.subject, restrict_globals=True)
+		validate_template(self.body, restrict_globals=True)
+		validate_template(self.pdf_name, restrict_globals=True)
 
 		if not self.customers:
 			frappe.throw(_("Customers not selected."))
 
-		if self.enable_auto_email:
-			if self.start_date and getdate(self.start_date) >= getdate(today()):
-				self.to_date = self.start_date
-				self.from_date = add_months(self.to_date, -1 * self.filter_duration)
+		if (
+			self.enable_auto_email
+			and self.start_date
+			and (
+				self.has_value_changed("start_date")
+				or self.has_value_changed("enable_auto_email")
+				or self.has_value_changed("report")
+			)
+		):
+			scheduled_date = self.start_date
+			if not self.has_value_changed("start_date") and not self.has_value_changed("enable_auto_email"):
+				scheduled_date = self.get_value_before_save(
+					"posting_date" if self.report == "General Ledger" else "to_date"
+				)
+
+			if self.report == "General Ledger":
+				self.to_date = scheduled_date
+			else:
+				self.posting_date = scheduled_date
+
+		if self.enable_auto_email and self.report == "General Ledger" and self.to_date:
+			self.from_date = add_months(self.to_date, -1 * self.filter_duration)
 
 		if self.print_format:
 			pf = frappe.db.get_value(
@@ -207,10 +226,10 @@ def get_statement_dict(doc, get_statement_dict=False):
 		if doc.report == "General Ledger":
 			filters.update(get_gl_filters(doc, entry, tax_id, presentation_currency))
 			col, res = get_soa(filters)
-			for x in [0, -2, -1]:
-				res[x]["account"] = res[x]["account"].replace("'", "")
 			if len(res) == 3:
 				continue
+			for x in [0, -2, -1]:
+				res[x]["account"] = (res[x]["account"] or "").replace("'", "")
 		else:
 			filters.update(get_ar_filters(doc, entry))
 			ar_res = get_ar_soa(filters)
@@ -229,7 +248,8 @@ def set_ageing(doc, entry):
 	ageing_filters = frappe._dict(
 		{
 			"company": doc.company,
-			"report_date": doc.posting_date,
+			"report_date": doc.to_date if doc.report == "General Ledger" else doc.posting_date,
+			"age_as_on": "Report Date" if doc.report == "General Ledger" else "Today",
 			"ageing_based_on": doc.ageing_based_on,
 			"range1": 30,
 			"range2": 60,
@@ -270,7 +290,7 @@ def get_gl_filters(doc, entry, tax_id, presentation_currency):
 		"categorize_by": doc.categorize_by,
 		"currency": doc.currency,
 		"project": [p.project_name for p in doc.project],
-		"show_opening_entries": 0,
+		"show_opening_entries": doc.show_opening_entries,
 		"include_default_book_entries": 0,
 		"tax_id": tax_id if tax_id else None,
 		"show_net_values_in_party_account": doc.show_net_values_in_party_account,
@@ -319,6 +339,14 @@ def get_html(doc, filters, entry, col, res, ageing):
 		from frappe.www.printview import get_letter_head
 
 		letter_head = get_letter_head(doc, 0)
+		# render letter head content as a template so its Jinja resolves against the doc
+		if letter_head.get("content"):
+			# nosemgrep: frappe-semgrep-rules.rules.security.frappe-ssti
+			letter_head["content"] = frappe.render_template(letter_head["content"], {"doc": doc})
+		if letter_head.get("footer"):
+			# nosemgrep: frappe-semgrep-rules.rules.security.frappe-ssti
+			letter_head["footer"] = frappe.render_template(letter_head["footer"], {"doc": doc})
+	# nosemgrep: frappe-semgrep-rules.rules.security.frappe-ssti -- template is a file path or a Print Format
 	html = frappe.render_template(
 		template_path,
 		{
@@ -518,7 +546,7 @@ def download_statements(document_name):
 		frappe.local.response.type = "download"
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def send_emails(document_name, from_scheduler=False, posting_date=None):
 	doc = frappe.get_doc("Process Statement Of Accounts", document_name)
 	doc.check_permission()
@@ -527,15 +555,15 @@ def send_emails(document_name, from_scheduler=False, posting_date=None):
 	if report:
 		for customer, report_pdf in report.items():
 			context = get_context(customer, doc)
-			filename = frappe.render_template(doc.pdf_name, context)
+			filename = frappe.render_template(doc.pdf_name, context, restrict_globals=True)
 			attachments = [{"fname": filename + ".pdf", "fcontent": report_pdf}]
 
 			recipients, cc = get_recipients_and_cc(customer, doc)
 			if not recipients:
 				continue
 
-			subject = frappe.render_template(doc.subject, context)
-			message = frappe.render_template(doc.body, context)
+			subject = frappe.render_template(doc.subject, context, restrict_globals=True)
+			message = frappe.render_template(doc.body, context, restrict_globals=True)
 
 			if doc.sender:
 				sender_email = frappe.db.get_value("Email Account", doc.sender, "email_id")
@@ -558,12 +586,14 @@ def send_emails(document_name, from_scheduler=False, posting_date=None):
 			)
 
 		if doc.enable_auto_email and from_scheduler:
-			new_to_date = getdate(posting_date or today())
-			if doc.frequency in ("Daily", "Weekly", "Biweekly"):
-				frequency = {"Daily": 1, "Weekly": 7, "Biweekly": 14}
-				new_to_date = add_days(new_to_date, frequency[doc.frequency])
-			else:
-				new_to_date = add_months(new_to_date, 1 if doc.frequency == "Monthly" else 3)
+			posting_date = getdate(posting_date or today())
+			new_to_date = getdate(doc.to_date if doc.report == "General Ledger" else doc.posting_date)
+			while new_to_date <= posting_date:
+				if doc.frequency in ("Daily", "Weekly", "Biweekly"):
+					frequency = {"Daily": 1, "Weekly": 7, "Biweekly": 14}
+					new_to_date = add_days(new_to_date, frequency[doc.frequency])
+				else:
+					new_to_date = add_months(new_to_date, 1 if doc.frequency == "Monthly" else 3)
 			new_from_date = add_months(new_to_date, -1 * doc.filter_duration)
 			doc.add_comment("Comment", "Emails sent on: " + frappe.utils.format_datetime(frappe.utils.now()))
 			if doc.report == "General Ledger":
@@ -576,14 +606,15 @@ def send_emails(document_name, from_scheduler=False, posting_date=None):
 		return False
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def send_auto_email():
 	frappe.has_permission("Process Statement Of Accounts", throw=True)
-	selected = frappe.get_list(
-		"Process Statement Of Accounts",
-		filters={"enable_auto_email": 1},
-		or_filters={"to_date": today(), "posting_date": today()},
-	)
-	for entry in selected:
-		send_emails(entry.name, from_scheduler=True)
+	for report, date_field in (("General Ledger", "to_date"), ("Accounts Receivable", "posting_date")):
+		selected = frappe.get_list(
+			"Process Statement Of Accounts",
+			filters={"enable_auto_email": 1, "report": report, date_field: ["<=", today()]},
+			or_filters=[["start_date", "is", "not set"], ["start_date", "<=", today()]],
+		)
+		for entry in selected:
+			send_emails(entry.name, from_scheduler=True)
 	return True

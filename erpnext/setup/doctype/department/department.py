@@ -5,6 +5,7 @@
 import json
 
 import frappe
+from frappe import _
 from frappe.utils.nestedset import NestedSet, get_root_of
 
 from erpnext.utilities.transaction_base import delete_events
@@ -38,14 +39,26 @@ class Department(NestedSet):
 			self.name = self.department_name
 
 	def validate(self):
+		if not self.is_new() and self.has_value_changed("company"):
+			frappe.throw(_("Department company cannot be changed"))
+
 		if not self.parent_department:
 			root = get_root_of("Department")
 			if root:
 				self.parent_department = root
 
+		if self.parent_department:
+			parent = frappe.db.get_value(
+				"Department", self.parent_department, ["company", "is_group"], as_dict=True
+			)
+			if parent and not parent.is_group:
+				frappe.throw(_("Parent Department must be a group"))
+			if parent and parent.company and parent.company != self.company:
+				frappe.throw(_("Parent Department must belong to the same company"))
+
 	def before_rename(self, old, new, merge=False):
 		# renaming consistency with abbreviation
-		if frappe.get_cached_value("Company", self.company, "abbr") not in new:
+		if not new.endswith(f" - {frappe.get_cached_value('Company', self.company, 'abbr')}"):
 			new = get_abbreviated_name(new, self.company)
 
 		return new
@@ -84,18 +97,26 @@ def get_children(doctype, parent=None, company=None, is_root=False, include_disa
 	else:
 		filters["parent_department"] = parent
 
-	if frappe.db.has_column(doctype, "disabled") and not include_disabled:
+	# `doctype` is caller-supplied and only reaches has_column; the query below is fixed to Department,
+	# so pin it rather than letting a caller probe another table's columns.
+	if frappe.db.has_column("Department", "disabled") and not include_disabled:
 		filters["disabled"] = False
 
-	return frappe.get_all("Department", fields=fields, filters=filters, order_by="name")
+	# get_list, not get_all: it applies the caller's User Permissions. Department carries no `if_owner`
+	# row, so this does not silently empty the tree.
+	return frappe.get_list("Department", fields=fields, filters=filters, order_by="name")
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def add_node():
 	from frappe.desk.treeview import make_tree_args
 
 	args = frappe.form_dict
 	args = make_tree_args(**args)
+
+	# `args` comes straight from form_dict, so without this the caller chooses the doctype created.
+	# insert() would still check permissions on whatever they named.
+	args.doctype = "Department"
 
 	if args.parent_department == args.company:
 		args.parent_department = None
