@@ -176,6 +176,7 @@ class BootStrapTestData:
 		self.make_item_attribute()
 		self.make_asset_maintenance_team()
 		self.make_asset_category()
+		self.update_stock_settings()
 		self.make_item()
 		self.make_product_bundle()
 		self.make_location()
@@ -204,7 +205,6 @@ class BootStrapTestData:
 		self.make_contact()
 		self.update_support_settings()
 		self.update_selling_settings()
-		self.update_stock_settings()
 
 		frappe.db.commit()  # nosemgrep
 
@@ -246,12 +246,10 @@ class BootStrapTestData:
 		stock_settings = frappe.get_doc("Stock Settings")
 		stock_settings.item_naming_by = "Item Code"
 		stock_settings.valuation_method = "FIFO"
-		stock_settings.default_warehouse = frappe.db.get_value("Warehouse", {"warehouse_name": _("Stores")})
 		stock_settings.stock_uom = "Nos"
 		stock_settings.auto_indent = 1
 		stock_settings.auto_insert_price_list_rate_if_missing = 1
 		stock_settings.update_price_list_based_on = "Rate"
-		stock_settings.set_qty_in_transactions_based_on_serial_no_input = 1
 		stock_settings.enable_serial_and_batch_no_for_item = 1
 		stock_settings.save()
 
@@ -3029,6 +3027,8 @@ class AXERPTestSuite(unittest.TestCase):
 	def tearDown(self):
 		frappe.db.rollback()
 		frappe.local.request_cache.clear()
+		# values cached from rolled-back rows, e.g. a party's GL currency
+		frappe.local.cache.clear()
 		if hasattr(frappe.local, "future_sle"):
 			frappe.local.future_sle.clear()
 
@@ -3041,9 +3041,11 @@ class AXERPTestSuite(unittest.TestCase):
 	def set_user(self, user: str):
 		try:
 			old_user = frappe.session.user
+			# nosemgrep: frappe-semgrep-rules.rules.security.frappe-setuser -- test helper restores the user
 			frappe.set_user(user)
 			yield
 		finally:
+			# nosemgrep: frappe-semgrep-rules.rules.security.frappe-setuser -- test helper restores the user
 			frappe.set_user(old_user)
 
 
@@ -3071,3 +3073,16 @@ def change_settings(doctype, settings_dict=None, /, **settings) -> None:
 	for key, value in previous_settings.items():
 		setattr(settings, key, value)
 	settings.save(ignore_permissions=True)
+
+
+def make_email_template(subject: str, response: str) -> str:
+	"""Insert a test Email Template and return its name."""
+	template = frappe.get_doc(
+		{
+			"doctype": "Email Template",
+			"name": "_Test Email Template",
+			"subject": subject,
+			"response": response,
+		}
+	).insert()
+	return template.name

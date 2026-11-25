@@ -4,9 +4,12 @@
  "allow_import": 1,
  "autoname": "naming_series:",
  "creation": "2013-06-18 12:39:59",
+ "description": "A customer's confirmed order.",
  "doctype": "DocType",
  "document_type": "Document",
+ "documentation": "https://docs.frappe.io/erpnext/user/manual/en/sales-order",
  "editable_grid": 1,
+ "enable_upload_first_workflow": 1,
  "engine": "InnoDB",
  "field_order": [
   "customer_section",
@@ -178,6 +181,8 @@
   "column_break_yvzv",
   "inter_company_order_reference",
   "party_account_currency",
+  "proforma_tab",
+  "proforma_html",
   "connections_tab"
  ],
  "fields": [
@@ -216,7 +221,6 @@
    "fieldtype": "Link",
    "hide_days": 1,
    "hide_seconds": 1,
-   "in_global_search": 1,
    "in_standard_filter": 1,
    "label": "Customer",
    "oldfieldname": "customer",
@@ -311,6 +315,7 @@
    "fieldtype": "Date",
    "hide_days": 1,
    "hide_seconds": 1,
+   "in_import_template": 1,
    "in_list_view": 1,
    "label": "Delivery Date",
    "no_copy": 1
@@ -321,6 +326,7 @@
    "fieldtype": "Data",
    "hide_days": 1,
    "hide_seconds": 1,
+   "in_global_search": 1,
    "label": "Customer's Purchase Order",
    "oldfieldname": "po_no",
    "oldfieldtype": "Data",
@@ -390,7 +396,6 @@
    "fieldtype": "Small Text",
    "hide_days": 1,
    "hide_seconds": 1,
-   "in_global_search": 1,
    "label": "Contact",
    "read_only": 1
   },
@@ -497,6 +502,7 @@
    "oldfieldtype": "Select",
    "options": "Currency",
    "print_hide": 1,
+   "read_only_depends_on": "eval:doc.inter_company_order_reference",
    "reqd": 1,
    "width": "100px"
   },
@@ -1116,6 +1122,7 @@
    "hide_days": 1,
    "hide_seconds": 1,
    "label": "Inter Company Order Reference",
+   "no_copy": 1,
    "options": "Purchase Order",
    "read_only": 1,
    "search_index": 1
@@ -1332,8 +1339,6 @@
    "width": "50%"
   },
   {
-   "fetch_from": "sales_partner.commission_rate",
-   "fetch_if_empty": 1,
    "fieldname": "commission_rate",
    "fieldtype": "Float",
    "hide_days": 1,
@@ -1520,6 +1525,17 @@
   {
    "fieldname": "column_break_49",
    "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "proforma_tab",
+   "fieldtype": "Tab Break",
+   "hidden": 1,
+   "label": "Proforma"
+  },
+  {
+   "fieldname": "proforma_html",
+   "fieldtype": "HTML",
+   "label": "Proforma Invoices"
   },
   {
    "fieldname": "connections_tab",
@@ -1759,11 +1775,12 @@
   }
  ],
  "grid_page_length": 50,
- "icon": "fa fa-file-text",
+ "icon": "shopping-cart",
  "idx": 105,
  "is_submittable": 1,
+ "link_display_mode": "Search",
  "links": [],
- "modified": "2026-09-16 11:42:07.000000",
+ "modified": "2026-11-16 04:16:51.560603",
  "modified_by": "Administrator",
  "module": "Selling",
  "name": "Sales Order",
@@ -1818,6 +1835,7 @@
    "email": 1,
    "print": 1,
    "read": 1,
+   "report": 1,
    "role": "Accounts User"
   },
   {

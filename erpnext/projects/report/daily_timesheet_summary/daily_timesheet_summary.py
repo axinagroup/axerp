@@ -6,8 +6,11 @@ import frappe
 from frappe import _
 from frappe.desk.reportview import build_match_conditions
 
+from erpnext.accounts.report.utils import validate_date_range
+
 
 def execute(filters=None):
+	validate_date_range(filters)
 	if not filters:
 		filters = {}
 	elif filters.get("from_date") or filters.get("to_date"):
@@ -56,7 +59,7 @@ def get_conditions(filters):
 	if filters.get("from_date"):
 		conditions += " and `tabTimesheet Detail`.from_time >= timestamp(%(from_date)s, %(from_time)s)"
 	if filters.get("to_date"):
-		conditions += " and `tabTimesheet Detail`.to_time <= timestamp(%(to_date)s, %(to_time)s)"
+		conditions += " and `tabTimesheet Detail`.from_time < timestamp(%(to_date)s, %(to_time)s)"
 
 	match_conditions = build_match_conditions("Timesheet")
 	if match_conditions:

@@ -32,7 +32,7 @@ from erpnext.accounts.utils import (
 from erpnext.assets.doctype.asset_depreciation_schedule.asset_depreciation_schedule import (
 	get_depr_schedule,
 )
-from erpnext.controllers.accounts_controller import AccountsController
+from erpnext.controllers.accounts_controller import AccountsController, validate_account_head
 from erpnext.setup.utils import get_exchange_rate as _get_exchange_rate
 
 
@@ -137,7 +137,9 @@ class JournalEntry(AccountsController):
 
 		self.clearance_date = None
 
+		self.validate_account_company()
 		self.validate_party()
+		self.ensure_supplier_is_not_blocked()
 		self.validate_entries_for_advance()
 		self.validate_multi_currency()
 		self.set_amounts_in_company_currency()
@@ -164,6 +166,14 @@ class JournalEntry(AccountsController):
 
 		if not self.title or (self.is_new() and self.amended_from):
 			self.title = self.get_title()
+
+	def validate_account_company(self):
+		"""Catch an account/Company mismatch on save, before GL Entry has to reject it on submit."""
+		if not self.company:
+			return
+		for d in self.get("accounts"):
+			if d.account:
+				validate_account_head(d.idx, d.account, self.company, _("Journal Entry"))
 
 	def validate_advance_accounts(self):
 		journal_accounts = set([x.account for x in self.accounts])
@@ -193,7 +203,7 @@ class JournalEntry(AccountsController):
 		self.has_asset_adjustment_entry()
 
 	def cancel(self):
-		if len(self.accounts) > 100:
+		if len(self.accounts) > 100 and not self.meta.queue_in_background:
 			queue_submission(self, "_cancel")
 		else:
 			return self._cancel()
@@ -211,6 +221,7 @@ class JournalEntry(AccountsController):
 		self.update_inter_company_jv()
 		self.update_invoice_discounting()
 		JournalTaxWithholding(self).on_submit()
+		self.update_payment_order_requests()
 
 	@frappe.whitelist()
 	def get_balance_for_periodic_accounting(self):
@@ -288,8 +299,8 @@ class JournalEntry(AccountsController):
 		if self.flags.get("ignore_reposting_on_reconciliation"):
 			return
 
-		self.needs_repost = self.check_if_fields_updated(fields_to_check=[], child_tables={"accounts": []})
-		if self.needs_repost:
+		needs_repost = self.check_if_fields_updated(fields_to_check=[], child_tables={"accounts": []})
+		if needs_repost:
 			self.validate_for_repost()
 			self.repost_accounting_entries()
 
@@ -324,6 +335,20 @@ class JournalEntry(AccountsController):
 		self.unlink_inter_company_jv()
 		self.unlink_asset_adjustment_entry()
 		self.update_invoice_discounting()
+		self.update_payment_order_requests(cancel=True)
+
+	def on_trash(self):
+		from erpnext.accounts.doctype.payment_order.payment_order import clear_payment_reference
+
+		super().on_trash()
+		clear_payment_reference(self)
+
+	def update_payment_order_requests(self, cancel=False):
+		from erpnext.accounts.doctype.payment_order.payment_order import (
+			update_payment_requests_from_journal_entry,
+		)
+
+		update_payment_requests_from_journal_entry(self, cancel=cancel)
 
 	def get_title(self):
 		return self.pay_to_recd_from or self.accounts[0].account
@@ -397,8 +422,10 @@ class JournalEntry(AccountsController):
 				if asset.calculate_depreciation:
 					self.update_journal_entry_link_on_depr_schedule(asset, d)
 					self.update_value_after_depreciation(asset, d.debit)
+					asset.sync_value_after_depreciation()
+				else:
+					asset.db_set("value_after_depreciation", asset.value_after_depreciation - d.debit)
 
-				asset.db_set("value_after_depreciation", asset.value_after_depreciation - d.debit)
 				asset.set_status()
 				asset.set_total_booked_depreciations()
 
@@ -549,7 +576,10 @@ class JournalEntry(AccountsController):
 						fb_row = asset.get("finance_books")[fb_idx - 1]
 						fb_row.value_after_depreciation += d.debit
 						fb_row.db_update()
-				asset.db_set("value_after_depreciation", asset.value_after_depreciation + d.debit)
+					asset.sync_value_after_depreciation()
+				else:
+					asset.db_set("value_after_depreciation", asset.value_after_depreciation + d.debit)
+
 				asset.set_status()
 				asset.set_total_booked_depreciations()
 			elif self.voucher_type == "Journal Entry" and d.reference_type == "Asset" and d.reference_name:
@@ -596,6 +626,9 @@ class JournalEntry(AccountsController):
 
 	def validate_party(self):
 		for d in self.get("accounts"):
+			if d.party_type and not frappe.db.exists("Party Type", d.party_type):
+				frappe.throw(_("Row {0}: {1} is not a valid Party Type").format(d.idx, d.party_type))
+
 			account_type = frappe.get_cached_value("Account", d.account, "account_type")
 
 			if account_type in ["Receivable", "Payable"]:
@@ -628,23 +661,13 @@ class JournalEntry(AccountsController):
 			)
 		)
 		if customers:
-			from erpnext.selling.doctype.customer.customer import check_credit_limit
-
-			customer_details = frappe._dict(
-				frappe.db.get_all(
-					"Customer Credit Limit",
-					filters={
-						"parent": ["in", customers],
-						"parenttype": ["=", "Customer"],
-						"company": ["=", self.company],
-					},
-					fields=["parent", "bypass_credit_limit_check"],
-					as_list=True,
-				)
+			from erpnext.selling.doctype.customer.customer import (
+				check_credit_limit,
+				is_sales_order_credit_check_bypassed,
 			)
 
 			for customer in customers:
-				ignore_outstanding_sales_order = bool(customer_details.get(customer))
+				ignore_outstanding_sales_order = is_sales_order_credit_check_bypassed(customer, self.company)
 				check_credit_limit(customer, self.company, ignore_outstanding_sales_order)
 
 	def validate_cheque_info(self):
@@ -1735,7 +1758,7 @@ def get_account_details_and_party_type(account, date, company, debit=None, credi
 @frappe.whitelist()
 def get_exchange_rate(
 	posting_date,
-	account=None,
+	account: str | None = None,
 	account_currency=None,
 	company=None,
 	reference_type=None,
@@ -1806,6 +1829,10 @@ def make_reverse_journal_entry(source_name, target_doc=None):
 	if not frappe.has_permission("Journal Entry", doc=source_name):
 		frappe.throw(_("Not permitted"), frappe.PermissionError)
 
+	return map_reverse_journal_entry(source_name, target_doc)
+
+
+def map_reverse_journal_entry(source_name: str, target_doc=None, ignore_permissions: bool = False):
 	reversal_of = frappe.db.get_value("Journal Entry", source_name, "reversal_of")
 	if reversal_of:
 		frappe.throw(
@@ -1853,6 +1880,7 @@ def make_reverse_journal_entry(source_name, target_doc=None):
 		},
 		target_doc,
 		post_process,
+		ignore_permissions=ignore_permissions,
 	)
 
 	return doclist

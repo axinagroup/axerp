@@ -89,19 +89,23 @@ frappe.ui.form.on("Blanket Order", {
 		if (frm.doc.blanket_order_type === "Selling") {
 			frm.set_df_property("customer", "reqd", 1);
 			frm.set_df_property("supplier", "reqd", 0);
-			frm.set_value("supplier", "");
+			if (frm.doc.supplier) {
+				frm.set_value("supplier", "");
+			}
 
 			frm.set_query("tc_name", function () {
-				return { filters: { selling: 1 } };
+				return { filters: { selling: 1, disabled: 0 } };
 			});
 		}
 		if (frm.doc.blanket_order_type === "Purchasing") {
 			frm.set_df_property("supplier", "reqd", 1);
 			frm.set_df_property("customer", "reqd", 0);
-			frm.set_value("customer", "");
+			if (frm.doc.customer) {
+				frm.set_value("customer", "");
+			}
 
 			frm.set_query("tc_name", function () {
-				return { filters: { buying: 1 } };
+				return { filters: { buying: 1, disabled: 0 } };
 			});
 		}
 	},

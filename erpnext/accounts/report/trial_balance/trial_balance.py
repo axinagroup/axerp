@@ -4,8 +4,12 @@
 
 import frappe
 from frappe import _
+from frappe.core.doctype.user_permission.user_permission import get_user_permissions
+from frappe.desk.reportview import build_match_conditions
+from frappe.permissions import get_allowed_docs_for_doctype
 from frappe.query_builder.functions import Sum
 from frappe.utils import add_days, cstr, flt, formatdate, getdate
+from pypika.terms import Bracket, LiteralValue
 
 import erpnext
 from erpnext.accounts.doctype.accounting_dimension.accounting_dimension import (
@@ -18,7 +22,12 @@ from erpnext.accounts.report.financial_statements import (
 	get_cost_centers_with_children,
 	set_gl_entries_by_account,
 )
-from erpnext.accounts.report.utils import convert_to_presentation_currency, get_currency
+from erpnext.accounts.report.utils import (
+	convert_to_presentation_currency,
+	get_currency,
+	has_gl_entry_restrictions,
+	validate_date_range,
+)
 from erpnext.accounts.utils import get_zero_cutoff
 
 value_fields = (
@@ -32,10 +41,28 @@ value_fields = (
 
 
 def execute(filters=None):
+	validate_company_permission(filters.company)
 	validate_filters(filters)
 	data = get_data(filters)
 	columns = get_columns()
 	return columns, data
+
+
+def validate_company_permission(company: str | None) -> None:
+	"""Check role access to Company and the user's User Permissions that apply to Company.
+
+	Only the user permissions on the Company itself apply. A document check would also match
+	the Company's link fields, such as its default accounts, against the user's restrictions,
+	and refuse a user who is restricted to some accounts.
+	"""
+	if not company:
+		return
+
+	allowed_companies = get_allowed_docs_for_doctype(get_user_permissions().get("Company", []), "Company")
+	if not frappe.has_permission("Company", "select") or (
+		allowed_companies and company not in allowed_companies
+	):
+		frappe.throw(_("You are not permitted to view {0}").format(company), frappe.PermissionError)
 
 
 def validate_filters(filters):
@@ -60,8 +87,7 @@ def validate_filters(filters):
 	filters.from_date = getdate(filters.from_date)
 	filters.to_date = getdate(filters.to_date)
 
-	if filters.from_date > filters.to_date:
-		frappe.throw(_("From Date cannot be greater than To Date"))
+	validate_date_range(filters)
 
 	if (filters.from_date < filters.year_start_date) or (filters.from_date > filters.year_end_date):
 		frappe.msgprint(
@@ -151,6 +177,7 @@ def get_rootwise_opening_balances(
 
 	last_period_closing_voucher = ""
 	ignore_closing_balances = frappe.get_single_value("Accounts Settings", "ignore_account_closing_balance")
+	ignore_closing_balances = ignore_closing_balances or has_gl_entry_restrictions()
 
 	if not ignore_closing_balances:
 		last_period_closing_voucher = frappe.db.get_all(
@@ -197,6 +224,7 @@ def get_rootwise_opening_balances(
 		)
 
 	opening = frappe._dict()
+	equity_accounts = get_equity_accounts(filters.company) if not ignore_reporting_currency else set()
 	for d in gle:
 		opening_dr_cr = {
 			"account": d.account,
@@ -211,9 +239,7 @@ def get_rootwise_opening_balances(
 			opening[d.account]["opening_credit"] += flt(d.credit)
 
 		else:
-			if d.get("report_type") == "Balance Sheet" and not (
-				d.get("root_type") == "Equity" or d.get("account_type") == "Equity"
-			):
+			if report_type == "Balance Sheet" and d.account not in equity_accounts:
 				opening[d.account]["opening_debit"] += flt(d.debit) * flt(exchange_rate)
 				opening[d.account]["opening_credit"] += flt(d.credit) * flt(exchange_rate)
 			else:
@@ -221,6 +247,20 @@ def get_rootwise_opening_balances(
 				opening[d.account]["opening_credit"] += flt(d.credit_in_reporting_currency)
 
 	return opening
+
+
+def get_equity_accounts(company: str) -> set[str]:
+	"""Equity accounts keep their historical rate when translated to the reporting currency."""
+	account = frappe.qb.DocType("Account")
+	return set(
+		frappe.qb.from_(account)
+		.select(account.name)
+		.where(
+			(account.company == company)
+			& ((account.root_type == "Equity") | (account.account_type == "Equity"))
+		)
+		.run(pluck=True)
+	)
 
 
 def get_opening_balance(
@@ -334,6 +374,9 @@ def get_opening_balance(
 					opening_balance = opening_balance.where(
 						closing_balance[dimension.fieldname].isin(filters[dimension.fieldname])
 					)
+
+	if match_conditions := build_match_conditions(doctype):
+		opening_balance = opening_balance.where(Bracket(LiteralValue(match_conditions)))
 
 	gle = opening_balance.run(as_dict=1)
 
@@ -574,9 +617,13 @@ def hide_group_accounts(data):
 
 
 def execute_snapshot_report(filters):
+	if has_gl_entry_restrictions():
+		return execute(filters)
+
 	from frappe.database.duckdb.database import get_latest_sync
 
 	if conn := get_latest_sync("GL Entry"):
+		validate_company_permission(filters.company)
 		validate_filters(filters)
 		columns = get_columns()
 		data = get_data_duckdb(filters, conn)

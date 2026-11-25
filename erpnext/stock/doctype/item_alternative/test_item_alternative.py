@@ -2,7 +2,7 @@
 # See license.txt
 
 import frappe
-from frappe.utils import flt
+from frappe.utils import flt, random_string
 
 from erpnext.controllers.subcontracting_controller import make_rm_stock_entry
 from erpnext.controllers.tests.test_subcontracting_controller import (
@@ -11,9 +11,13 @@ from erpnext.controllers.tests.test_subcontracting_controller import (
 	set_backflush_based_on,
 )
 from erpnext.manufacturing.doctype.production_plan.test_production_plan import make_bom
-from erpnext.manufacturing.doctype.work_order.test_work_order import make_wo_order_test_record
+from erpnext.manufacturing.doctype.work_order.test_work_order import (
+	allow_alternative_item,
+	make_wo_order_test_record,
+)
 from erpnext.manufacturing.doctype.work_order.work_order import make_stock_entry
 from erpnext.stock.doctype.item.test_item import create_item
+from erpnext.stock.doctype.item_alternative.item_alternative import get_alternative_items
 from erpnext.stock.doctype.stock_reconciliation.stock_reconciliation import (
 	EmptyStockReconciliationItemsError,
 )
@@ -118,6 +122,80 @@ class TestItemAlternative(AXERPTestSuite):
 		self.assertEqual(status, True)
 		set_backflush_based_on("Material Transferred for Subcontract")
 
+	def test_alternative_item_must_be_allowed_for_work_order(self):
+		create_stock_reconciliation(
+			item_code="Test FG A RW 2", warehouse="_Test Warehouse - _TC", qty=5, rate=2000
+		)
+		unrelated_item = create_item("_Test Unrelated RM For Alternative").name
+		create_stock_reconciliation(
+			item_code=unrelated_item, warehouse="_Test Warehouse - _TC", qty=5, rate=1
+		)
+		work_order = make_wo_order_test_record(
+			production_item="Test Finished Goods - A",
+			qty=5,
+			source_warehouse="_Test Warehouse - _TC",
+			wip_warehouse="Test Supplier Warehouse - _TC",
+		)
+
+		ste = frappe.get_doc(make_stock_entry(work_order.name, "Material Transfer for Manufacture", 5))
+		substitute_item(ste, "Test FG A RW 1", unrelated_item)
+		self.assertRaises(frappe.ValidationError, ste.insert)
+
+		work_order.db_set("allow_alternative_item", 1)
+		ste = frappe.get_doc(make_stock_entry(work_order.name, "Material Transfer for Manufacture", 5))
+		substitute_item(ste, "Test FG A RW 1", unrelated_item)
+		self.assertRaises(frappe.ValidationError, ste.insert)
+
+	def test_transferred_alternative_can_be_consumed_and_returned_after_approval_removed(self):
+		from erpnext.manufacturing.doctype.work_order.work_order import make_stock_return_entry
+
+		create_stock_reconciliation(
+			item_code="Alternate Item For A RW 1", warehouse="_Test Warehouse - _TC", qty=5, rate=2000
+		)
+		create_stock_reconciliation(
+			item_code="Test FG A RW 2", warehouse="_Test Warehouse - _TC", qty=5, rate=2000
+		)
+		work_order = make_wo_order_test_record(
+			production_item="Test Finished Goods - A",
+			qty=5,
+			source_warehouse="_Test Warehouse - _TC",
+			wip_warehouse="Test Supplier Warehouse - _TC",
+		)
+		allow_alternative_item(work_order, "Test FG A RW 1", "Alternate Item For A RW 1")
+
+		transfer = frappe.get_doc(make_stock_entry(work_order.name, "Material Transfer for Manufacture", 5))
+		substitute_item(transfer, "Test FG A RW 1", "Alternate Item For A RW 1")
+		transfer.submit()
+
+		frappe.db.delete(
+			"Item Alternative",
+			{"item_code": "Test FG A RW 1", "alternative_item_code": "Alternate Item For A RW 1"},
+		)
+
+		manufacture = frappe.get_doc(make_stock_entry(work_order.name, "Manufacture", 3))
+		manufacture.submit()
+
+		work_order.reload()
+		work_order.db_set("status", "Closed")
+		return_entry = make_stock_return_entry(work_order.name)
+		return_entry.company = work_order.company
+		return_entry.submit()
+
+		returned_items = {row.item_code: row.qty for row in return_entry.items}
+		self.assertEqual(returned_items.get("Alternate Item For A RW 1"), 2)
+
+	def test_item_and_alternative_item_are_mandatory(self):
+		for fieldname in ("item_code", "alternative_item_code"):
+			doc = frappe.get_doc(
+				{
+					"doctype": "Item Alternative",
+					"item_code": "Test FG A RW 1",
+					"alternative_item_code": "Alternate Item For A RW 1",
+				}
+			)
+			doc.set(fieldname, None)
+			self.assertRaises(frappe.MandatoryError, doc.insert)
+
 	def test_alternative_item_for_production_rm(self):
 		create_stock_reconciliation(
 			item_code="Alternate Item For A RW 1", warehouse="_Test Warehouse - _TC", qty=5, rate=2000
@@ -131,6 +209,7 @@ class TestItemAlternative(AXERPTestSuite):
 			source_warehouse="_Test Warehouse - _TC",
 			wip_warehouse="Test Supplier Warehouse - _TC",
 		)
+		allow_alternative_item(pro_order, "Test FG A RW 1", "Alternate Item For A RW 1")
 
 		reserved_qty_for_production = frappe.db.get_value(
 			"Bin",
@@ -165,6 +244,37 @@ class TestItemAlternative(AXERPTestSuite):
 
 		self.assertEqual(status, True)
 		ste1.submit()
+
+	def test_get_alternative_items_needs_item_read_permission(self):
+		from erpnext.tests.permission_test_utils import as_user, assert_refused, make_fenced_user
+
+		suffix = random_string(8)
+		base = f"_Test IA Permission Base {suffix}"
+		alternative = f"_Test IA Permission Alternative {suffix}"
+		for item_code in (base, alternative):
+			create_item(item_code)
+			frappe.db.set_value("Item", item_code, "allow_alternative_item", 1)
+		make_item_alternative(base, alternative, two_way=1)
+
+		for user, roles in (
+			("_test_ia_no_role@example.com", []),
+			("_test_ia_desk@example.com", ["Desk User"]),
+		):
+			with as_user(make_fenced_user(user, roles)):
+				assert_refused(self, get_alternative_items, "Item", "", "name", 0, 20, {"item_code": base})
+
+		with as_user(make_fenced_user("_test_ia_manufacturing@example.com", ["Manufacturing User"])):
+			for item_code, expected in ((base, alternative), (alternative, base)):
+				results = get_alternative_items("Item", "", "name", 0, 20, {"item_code": item_code})
+				self.assertEqual([list(row) for row in results], [[expected]])
+
+
+def substitute_item(stock_entry, original_item, alternative_item):
+	for row in stock_entry.items:
+		if row.item_code == original_item:
+			row.item_code = alternative_item
+			row.item_name = alternative_item
+			row.original_item = original_item
 
 
 def make_items():
@@ -206,3 +316,16 @@ def make_items():
 				"company": "_Test Company",
 			}
 		).insert(ignore_permissions=True)
+
+
+def make_item_alternative(item_code, alternative_item_code, two_way=0):
+	doc = frappe.get_doc(
+		{
+			"doctype": "Item Alternative",
+			"item_code": item_code,
+			"alternative_item_code": alternative_item_code,
+			"two_way": two_way,
+		}
+	)
+	doc.insert()
+	return doc

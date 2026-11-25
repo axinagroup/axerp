@@ -9,6 +9,8 @@ from frappe import _
 from frappe.query_builder.functions import Coalesce, Sum
 from frappe.utils import cint, date_diff, flt, getdate
 
+from erpnext.accounts.report.utils import validate_date_range
+
 
 def execute(filters=None):
 	if not filters:
@@ -27,6 +29,7 @@ def execute(filters=None):
 
 def validate_filters(filters):
 	from_date, to_date = filters.get("from_date"), filters.get("to_date")
+	validate_date_range({"from_date": getdate(from_date), "to_date": getdate(to_date)})
 
 	if not from_date and to_date:
 		frappe.throw(_("From and To Dates are required."))
@@ -215,18 +218,19 @@ def get_columns(filters):
 					"fieldtype": "Data",
 					"width": 100,
 				},
+				{
+					"label": _("Qty"),
+					"fieldname": "qty",
+					"fieldtype": "Float",
+					"width": 140,
+					"convertible": "qty",
+					"disable_total": True,
+				},
 			]
 		)
 
 	columns.extend(
 		[
-			{
-				"label": _("Qty"),
-				"fieldname": "qty",
-				"fieldtype": "Float",
-				"width": 140,
-				"convertible": "qty",
-			},
 			{
 				"label": _("Qty in Stock UOM"),
 				"fieldname": "stock_qty",

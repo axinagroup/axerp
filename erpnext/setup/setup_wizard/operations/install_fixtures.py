@@ -366,7 +366,7 @@ def update_selling_defaults():
 	selling_settings.so_required = "No"
 	selling_settings.dn_required = "No"
 	selling_settings.allow_multiple_items = 1
-	selling_settings.sales_update_frequency = "Each Transaction"
+	selling_settings.sales_update_frequency = "Daily"
 	selling_settings.save()
 
 
@@ -390,6 +390,7 @@ def update_item_variant_settings():
 def add_uom_data():
 	# add UOMs
 	uoms = json.loads(
+		# nosemgrep: frappe-semgrep-rules.rules.security.frappe-security-file-traversal -- path is inside the app
 		open(frappe.get_app_path("erpnext", "setup", "setup_wizard", "data", "uom_data.json")).read()
 	)
 	for d in uoms:
@@ -403,6 +404,7 @@ def add_uom_data():
 
 	# bootstrap uom conversion factors
 	uom_conversions = json.loads(
+		# nosemgrep: frappe-semgrep-rules.rules.security.frappe-security-file-traversal -- path is inside the app
 		open(
 			frappe.get_app_path("erpnext", "setup", "setup_wizard", "data", "uom_conversion_data.json")
 		).read()
@@ -537,21 +539,17 @@ def update_stock_settings():
 	stock_settings = frappe.get_doc("Stock Settings")
 	stock_settings.item_naming_by = "Item Code"
 	stock_settings.valuation_method = "FIFO"
-	stock_settings.default_warehouse = frappe.db.get_value("Warehouse", {"warehouse_name": _("Stores")})
 	stock_settings.stock_uom = "Nos"
 	stock_settings.auto_indent = 1
 	stock_settings.auto_insert_price_list_rate_if_missing = 1
 	stock_settings.update_price_list_based_on = "Rate"
-	stock_settings.set_qty_in_transactions_based_on_serial_no_input = 1
 	stock_settings.flags.ignore_permissions = True
 	stock_settings.save()
 
 
-def create_bank_account(args, demo=False):
+def create_bank_account(args):
 	if not args.get("bank_account"):
-		if not demo:
-			return
-		args["bank_account"] = _("Demo Bank Account")
+		return
 
 	company_name = args.get("company_name")
 	bank_account_group = frappe.db.get_value(

@@ -139,12 +139,26 @@ def check_pos_profile_access(pos_profile):
 def get_parent_item_group(pos_profile):
 	check_pos_profile_access(pos_profile)
 
+	# A deterministic default: get_item_groups() is list(set(...)), so [0] could land on a
+	# narrow/empty subtree and hide most of the catalog after a worker restart.
 	item_groups = get_item_groups(pos_profile)
+	if item_groups:
+		return get_common_ancestor_item_group(item_groups)
 
-	if not item_groups:
-		item_groups = frappe.get_all("Item Group", {"lft": 1, "is_group": 1}, pluck="name")
+	return frappe.get_all("Item Group", {"lft": 1, "is_group": 1}, pluck="name")[0]
 
-	return item_groups[0] if item_groups else None
+
+def get_common_ancestor_item_group(item_groups: list[str]) -> str:
+	bounds = frappe.get_all("Item Group", filters={"name": ("in", item_groups)}, fields=["lft", "rgt"])
+
+	# Deepest group whose subtree covers every group is their closest common ancestor.
+	return frappe.get_all(
+		"Item Group",
+		filters={"lft": ("<=", min(r.lft for r in bounds)), "rgt": (">=", max(r.rgt for r in bounds))},
+		pluck="name",
+		order_by="lft desc",
+		limit=1,
+	)[0]
 
 
 @frappe.whitelist()
@@ -464,8 +478,8 @@ def get_past_order_list(search_term, status, limit=20):
 	return invoice_list
 
 
-@frappe.whitelist()
-def set_customer_info(fieldname, customer, value=""):
+@frappe.whitelist(methods=["POST"])
+def set_customer_info(fieldname: str, customer: str, value: str = ""):
 	customer_doc = frappe.get_doc("Customer", customer)
 	customer_doc.check_permission("write")
 

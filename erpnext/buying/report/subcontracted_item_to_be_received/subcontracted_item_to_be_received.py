@@ -5,9 +5,12 @@
 import frappe
 from frappe import _
 
+from erpnext.accounts.report.utils import validate_date_range
+
 
 def execute(filters=None):
-	if filters.from_date >= filters.to_date:
+	validate_date_range(filters)
+	if filters.from_date > filters.to_date:
 		frappe.msgprint(_("To Date must be greater than From Date"))
 
 	data = []
@@ -82,6 +85,7 @@ def get_subcontract_orders(filters):
 		["transaction_date", "<=", filters.to_date],
 		["transaction_date", ">=", filters.from_date],
 		["docstatus", "=", 1],
+		["status", "!=", "Closed"],
 	]
 
 	if filters.order_type == "Purchase Order":

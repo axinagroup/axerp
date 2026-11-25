@@ -33,8 +33,11 @@ class ItemGroup(NestedSet):
 
 	def validate(self):
 		if not self.parent_item_group and not frappe.in_test:
-			if frappe.db.exists("Item Group", _("All Item Groups")):
-				self.parent_item_group = _("All Item Groups")
+			root = frappe.db.get_value(
+				"Item Group", {"parent_item_group": ("is", "not set"), "is_group": 1}, order_by="lft asc"
+			)
+			if root and root != self.name:
+				self.parent_item_group = root
 		self.validate_item_group_defaults()
 		self.check_item_tax()
 
@@ -66,9 +69,9 @@ class ItemGroup(NestedSet):
 		frappe.cache().hdel("child_item_groups", self.name)
 
 	def validate_item_group_defaults(self):
-		from erpnext.stock.doctype.item.item import validate_item_default_company_links
+		from erpnext.stock.doctype.item.item import validate_item_defaults
 
-		validate_item_default_company_links(self.item_group_defaults)
+		validate_item_defaults(self.item_group_defaults)
 
 
 def get_child_item_groups(item_group_name):

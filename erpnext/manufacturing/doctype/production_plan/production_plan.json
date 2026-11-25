@@ -2,8 +2,10 @@
  "actions": [],
  "autoname": "naming_series:",
  "creation": "2017-10-29 11:53:09.523362",
+ "description": "Plans the work orders and materials needed for your demand.",
  "doctype": "DocType",
  "document_type": "Document",
+ "documentation": "https://docs.frappe.io/erpnext/user/manual/en/production-plan",
  "engine": "InnoDB",
  "field_order": [
   "naming_series",
@@ -12,6 +14,7 @@
   "column_break1",
   "posting_date",
   "reserve_stock",
+  "consider_process_loss",
   "filters",
   "item_code",
   "customer",
@@ -52,6 +55,7 @@
   "include_safety_stock",
   "ignore_existing_ordered_qty",
   "column_break_25",
+  "raw_material_group_warehouse",
   "for_warehouse",
   "get_items_for_mr",
   "transfer_materials",
@@ -319,6 +323,13 @@
    "options": "Warehouse"
   },
   {
+   "description": "Optional group warehouse. Raw material availability is checked across its child warehouses; material is still received into For Warehouse.",
+   "fieldname": "raw_material_group_warehouse",
+   "fieldtype": "Link",
+   "label": "Raw Material Group Warehouse",
+   "options": "Warehouse"
+  },
+  {
    "fieldname": "warehouses",
    "fieldtype": "Table MultiSelect",
    "hidden": 1,
@@ -438,14 +449,21 @@
    "fieldname": "reserve_stock",
    "fieldtype": "Check",
    "label": "Reserve Stock"
+  },
+  {
+   "default": "0",
+   "description": "Work Orders are made larger to cover their BOM's % Process Loss",
+   "fieldname": "consider_process_loss",
+   "fieldtype": "Check",
+   "label": "Consider Process Loss"
   }
  ],
  "grid_page_length": 50,
- "icon": "fa fa-calendar",
+ "icon": "calendar-check",
  "index_web_pages_for_search": 1,
  "is_submittable": 1,
  "links": [],
- "modified": "2025-08-12 19:48:09.302503",
+ "modified": "2026-10-27 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "Manufacturing",
  "name": "Production Plan",

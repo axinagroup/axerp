@@ -3,6 +3,17 @@
 
 frappe.provide("erpnext.company");
 
+// Static filters (is_group / disabled / warehouse_type) live in the fields' link_filters.
+const WAREHOUSE_DEFAULT_FIELDS = [
+	"default_warehouse",
+	"sample_retention_warehouse",
+	"default_in_transit_warehouse",
+	"default_warehouse_for_sales_return",
+	"default_wip_warehouse",
+	"default_fg_warehouse",
+	"default_scrap_warehouse",
+];
+
 frappe.ui.form.on("Company", {
 	onload: function (frm) {
 		if (frm.doc.__islocal && frm.doc.parent_company) {
@@ -37,7 +48,7 @@ frappe.ui.form.on("Company", {
 		});
 
 		frm.set_query("default_selling_terms", function () {
-			return { filters: { selling: 1 } };
+			return { filters: { selling: 1, disabled: 0 } };
 		});
 
 		frm.set_query("default_sales_contact", function (doc) {
@@ -48,26 +59,13 @@ frappe.ui.form.on("Company", {
 		});
 
 		frm.set_query("default_buying_terms", function () {
-			return { filters: { buying: 1 } };
+			return { filters: { buying: 1, disabled: 0 } };
 		});
 
-		frm.set_query("default_in_transit_warehouse", function () {
-			return {
-				filters: {
-					warehouse_type: "Transit",
-					is_group: 0,
-					company: frm.doc.company_name,
-				},
-			};
-		});
-
-		frm.set_query("default_warehouse_for_sales_return", function () {
-			return {
-				filters: {
-					company: frm.doc.name,
-					is_group: 0,
-				},
-			};
+		WAREHOUSE_DEFAULT_FIELDS.forEach((fieldname) => {
+			frm.set_query(fieldname, function (doc) {
+				return { filters: { company: doc.name } };
+			});
 		});
 
 		["default_wip_warehouse", "default_fg_warehouse", "default_scrap_warehouse"].forEach((fieldname) => {
@@ -225,7 +223,7 @@ frappe.ui.form.on("Company", {
 								label: __("Please enter the company name to confirm"),
 								reqd: 1,
 								description: __(
-									"Please make sure you really want to delete all the transactions for {0}. Your master data will remain as it is. This action cannot be undone.",
+									"Please make sure you really want to delete all the transactions for {0}. Your master data will remain as it is. Naming series counters will not be reset. This action cannot be undone.",
 									[frappe.utils.bold(frm.doc.name)]
 								),
 							},

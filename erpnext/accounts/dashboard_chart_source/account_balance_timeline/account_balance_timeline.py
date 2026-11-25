@@ -37,13 +37,16 @@ def get(
 	filters = frappe.parse_json(filters) or frappe.parse_json(chart.filters_json)
 
 	account = filters.get("account")
-	filters.get("company")
+	company = filters.get("company")
 
-	if not account and chart_name:
+	# the account defaults to the company's default bank account, which a new company has not set yet
+	if not account:
+		if not company:
+			frappe.throw(_("Choose a company in this chart's filters to see its bank balance."))
 		frappe.throw(
-			_("Account is not set for the dashboard chart {0}").format(
-				get_link_to_form("Dashboard Chart", chart_name)
-			)
+			_(
+				"Choose a bank account in this chart's filters, or set a default bank account on {0}, to see its balance."
+			).format(company)
 		)
 
 	if not frappe.db.exists("Account", account) and chart_name:
@@ -132,6 +135,8 @@ def get_dates_from_timegrain(from_date, to_date, timegrain):
 		months = 1
 	elif "Quarterly" == timegrain:
 		months = 3
+	elif "Yearly" == timegrain:
+		years = 1
 
 	dates = [get_period_ending(from_date, timegrain)]
 	while getdate(dates[-1]) < getdate(to_date):

@@ -19,20 +19,20 @@ frappe.listview_settings["Delivery Note"] = {
 		} else if (doc.status === "Return Issued") {
 			return [__("Return Issued"), "grey", "status,=,Return Issued"];
 		} else if (flt(doc.per_billed) == 0) {
-			return [__("To Bill"), "orange", "per_billed,=,0|docstatus,=,1"];
+			return [__("To Bill"), "orange", "status,=,To Bill"];
 		} else if (flt(doc.per_billed, 2) > 0 && flt(doc.per_billed, 2) < 100) {
-			return [__("Partially Billed"), "yellow", "per_billed,<,100|docstatus,=,1"];
+			return [__("Partially Billed"), "yellow", "status,=,Partially Billed"];
 		} else if (flt(doc.per_billed, 2) === 100) {
-			return [__("Completed"), "green", "per_billed,=,100|docstatus,=,1"];
+			return [__("Completed"), "green", "status,=,Completed"];
 		}
 	},
 	onload: function (doclist) {
-		const action = () => {
-			const selected_docs = doclist.get_checked_items();
+		const action = async () => {
 			const docnames = doclist.get_checked_items(true);
 
-			if (selected_docs.length > 0) {
-				frappe.new_doc("Delivery Trip").then(() => {
+			if (docnames.length > 0) {
+				const { message } = await frappe.db.get_value("Delivery Note", docnames[0], "company");
+				frappe.new_doc("Delivery Trip", { company: message.company }).then(() => {
 					// Empty out the child table before inserting new ones
 					cur_frm.set_value("delivery_stops", []);
 
